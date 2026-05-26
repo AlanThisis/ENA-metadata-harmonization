@@ -111,16 +111,21 @@ Use these to set `mesh_term` and inform `canonical_disease` in the output.
 
 **IMPORTANT:** The sample CSV can be very large (100s of samples, 100s of columns). Do NOT read the full file directly with the Read tool.
 
-**First**, check file size and column count:
+**First**, always inspect the raw data structure:
 
 ```bash
 wc -l /tmp/samples.csv
-head -1 /tmp/samples.csv
+head -5 /tmp/samples.csv
 ```
 
-**If the CSV has ≤ 100 rows and ≤ 50 columns**, it's safe to read with the Read tool.
+This shows you:
+- File size (rows)
+- Raw data including quoted fields and commas inside values
+- Whether the CSV is simple (no quotes) or complex (quoted fields with embedded commas)
 
-**If larger**, use shell commands to probe specific columns:
+**Then**, choose your probing tool based on what you see:
+
+**For simple CSVs (no quoted fields with commas):**
 
 ```bash
 # List all columns
@@ -131,12 +136,22 @@ cut -d, -f5 /tmp/samples.csv | tail -n +2 | sort | uniq -c
 
 # Search for patterns (e.g., disease-related columns)
 head -1 /tmp/samples.csv | grep -io 'disease\|health\|case\|control'
+```
 
-# Extract specific columns for analysis (e.g., columns 2,5,6)
+**For complex CSVs (quoted fields with commas inside):**
+
+```bash
+# Use Python's CSV reader to handle quoting correctly
+python3 -c "import csv; r=csv.reader(open('/tmp/samples.csv')); cols=[next(r)]; [cols.append(row) for row in r]; print('\\n'.join([f'{i}: {cols[0][i]}' for i in range(len(cols[0]))]))"
+
+# Extract and analyze a specific column (e.g., column 5)
+python3 -c "import csv; r=csv.reader(open('/tmp/samples.csv')); next(r); vals=[row[5] for row in r if len(row)>5]; from collections import Counter; print(Counter(vals).most_common(20))"
+
+# Extract multiple columns for analysis
 python3 -c "import csv; r=csv.reader(open('/tmp/samples.csv')); [print(row[1], row[4], row[5]) for row in r]"
 ```
 
-Follow the Signal Probe Order below on the columns you identify.
+**Never use `cut -d','` on CSVs with quoted fields** — it breaks on embedded commas. Always preview with `head -5` first.
 
 **Step 5 — Assign labels and produce output CSV**
 
