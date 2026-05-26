@@ -109,7 +109,34 @@ Use these to set `mesh_term` and inform `canonical_disease` in the output.
 
 **Step 4 — Probe the sample CSV for case/control signal**
 
-Follow the Signal Probe Order below. Use `head -1 /tmp/samples.csv` to list columns, then inspect relevant ones with `cut -d, -f<N> /tmp/samples.csv | sort | uniq -c`.
+**IMPORTANT:** The sample CSV can be very large (100s of samples, 100s of columns). Do NOT read the full file directly with the Read tool.
+
+**First**, check file size and column count:
+
+```bash
+wc -l /tmp/samples.csv
+head -1 /tmp/samples.csv
+```
+
+**If the CSV has ≤ 100 rows and ≤ 50 columns**, it's safe to read with the Read tool.
+
+**If larger**, use shell commands to probe specific columns:
+
+```bash
+# List all columns
+head -1 /tmp/samples.csv | tr ',' '\n' | nl
+
+# Count unique values in a column (e.g., column 5)
+cut -d, -f5 /tmp/samples.csv | tail -n +2 | sort | uniq -c
+
+# Search for patterns (e.g., disease-related columns)
+head -1 /tmp/samples.csv | grep -io 'disease\|health\|case\|control'
+
+# Extract specific columns for analysis (e.g., columns 2,5,6)
+python3 -c "import csv; r=csv.reader(open('/tmp/samples.csv')); [print(row[1], row[4], row[5]) for row in r]"
+```
+
+Follow the Signal Probe Order below on the columns you identify.
 
 **Step 5 — Assign labels and produce output CSV**
 
@@ -154,6 +181,20 @@ Use the abstract to infer group structure when metadata alone is insufficient:
 
 ---
 
+## Phenotypic data extraction
+
+Beyond cohort labels, probe the sample CSV for phenotypic metadata: `age`, `sex`, `disease`. Most ENA studies lack this, but extract when present.
+
+**Age**: Look for columns named `age`, `age_at_collection`, `host_age`, or numeric values in units (years, months). Record as `<value>` or `<min>-<max>` if a range.
+
+**Sex**: Check columns `sex`, `gender`, `host_sex`. Map values: `M` / `male` / `boy` → `male`; `F` / `female` / `girl` → `female`; `other` / `not_determined` → blank.
+
+**Disease**: Already extracted via signal probing, but capture the specific disease term if available (e.g. `colorectal cancer`, `inflammatory bowel disease`).
+
+Leave blank if not found.
+
+---
+
 ## Output Schema
 
 Produce a CSV with exactly these columns in this order:
@@ -169,6 +210,9 @@ Produce a CSV with exactly these columns in this order:
 | `label_source` | `explicit_field` / `alias_pattern` / `free_text` / `abstract_reconciliation` | the probe level that assigned this label |
 | `control_type` | e.g. `healthy_volunteer`, `adjacent_normal`, `antibiotic_naive` | blank when label is not `control` |
 | `confidence` | `high` / `medium` / `low` | |
+| `age` | e.g. `42`, `18-65`, blank if not found | extracted from ENA metadata |
+| `sex` | `male` / `female` / blank if not found | extracted and normalized |
+| `disease` | e.g. `colorectal cancer` | phenotypic disease term, blank if not found |
 | `separable` | `true` / `false` | whether the dataset can be reliably split into cohorts |
 | `notes` | free text | required when `separable=false`, `confidence=low`, or when ENA metadata and abstract disagree |
 
