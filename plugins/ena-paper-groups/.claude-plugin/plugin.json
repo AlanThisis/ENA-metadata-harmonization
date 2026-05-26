@@ -1,0 +1,4 @@
+{
+  "name": "ena-paper-groups",
+  "description": "Separate ENA samples into disease, control, or other paper-defined cohorts using ENA metadata and paper context."
+}
