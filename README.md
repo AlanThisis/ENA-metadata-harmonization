@@ -2,6 +2,10 @@
 
 Claude Code plugin for classifying microbiome samples from ENA studies into labeled cohorts (disease, control, or other) using ENA metadata, paper abstracts, and MeSH disease annotations.
 
+## Pipeline
+
+![ENA Harmonization Pipeline](docs/ena_harmonization_pipeline.svg)
+
 ## Install
 
 ```
