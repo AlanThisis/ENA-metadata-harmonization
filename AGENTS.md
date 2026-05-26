@@ -8,6 +8,7 @@ This repository currently centers on small Python CLIs for ENA and literature me
   - `get_abstracts.py`: PMID/PMCID to abstract text
   - `get_disease_entities.py`: PMID/PMCID to PubTator disease entities
   - `get_ena_project_samples.py`: ENA project accession to flattened sample metadata CSV
+  - `get_ena_accession.py`: PMID/PMCID to ENA/SRA project accessions (via PMC full-text regex)
 - `.claude-plugin/marketplace.json`: marketplace catalog for Claude Code plugin distribution
 - `plugins/microbiome-harmonization/`: Claude Code plugin for cohort harmonization
   - `.claude-plugin/plugin.json`: plugin manifest (name, version, description)
@@ -23,7 +24,8 @@ Use `uv run --with requests` for local execution so dependencies stay ephemeral.
 - `uv run --with requests python3 scripts/get_abstracts.py PMC3531190`
 - `uv run --with requests python3 scripts/get_disease_entities.py PMC10797958`
 - `uv run --with requests python3 scripts/get_ena_project_samples.py PRJEB46665 --max-samples 2`
-- `uv run --with requests python3 -m py_compile scripts/get_abstracts.py scripts/get_disease_entities.py scripts/get_ena_project_samples.py`
+- `uv run --with requests python3 scripts/get_ena_accession.py PMC4681099`
+- `uv run --with requests python3 -m py_compile scripts/get_abstracts.py scripts/get_disease_entities.py scripts/get_ena_project_samples.py scripts/get_ena_accession.py`
 
 For plugin development:
 
