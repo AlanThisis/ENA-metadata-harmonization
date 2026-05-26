@@ -1,0 +1,8 @@
+{
+  "name": "microbiome-harmonization",
+  "description": "Classify ENA microbiome samples into labeled cohorts (disease, control, or other) given a paper ID and ENA project accession.",
+  "version": "1.0.0",
+  "author": {
+    "name": "MMC Lab"
+  }
+}

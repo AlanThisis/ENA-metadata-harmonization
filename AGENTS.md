@@ -4,13 +4,15 @@
 
 This repository currently centers on small Python CLIs for ENA and literature metadata retrieval.
 
-- `scripts/`: executable utilities
+- `scripts/`: executable utilities (local dev copies)
   - `get_abstracts.py`: PMID/PMCID to abstract text
   - `get_disease_entities.py`: PMID/PMCID to PubTator disease entities
   - `get_ena_project_samples.py`: ENA project accession to flattened sample metadata CSV
-- `plugins/ena-paper-groups/`: local Claude Code plugin scaffold
-  - `.claude-plugin/plugin.json`: plugin manifest
-  - `skills/separate-samples/SKILL.md`: skill entrypoint
+- `.claude-plugin/marketplace.json`: marketplace catalog for Claude Code plugin distribution
+- `plugins/microbiome-harmonization/`: Claude Code plugin for cohort harmonization
+  - `.claude-plugin/plugin.json`: plugin manifest (name, version, description)
+  - `scripts/`: bundled copies of the three CLI scripts (required for marketplace install)
+  - `skills/harmonize/SKILL.md`: main skill — invoked as `/microbiome-harmonization:harmonize <PMID> <ENA_ACCESSION>`
 
 Keep new automation scripts in `scripts/`. Put Claude plugin assets under `plugins/<plugin-name>/`.
 
@@ -25,8 +27,8 @@ Use `uv run --with requests` for local execution so dependencies stay ephemeral.
 
 For plugin development:
 
-- `claude --plugin-dir ./plugins/ena-paper-groups`
-- Then run `/ena-paper-groups:separate-samples`
+- `claude --plugin-dir ./plugins/microbiome-harmonization`
+- Then run `/microbiome-harmonization:harmonize <PMID_or_PMCID> <ENA_ACCESSION>`
 - Use `/reload-plugins` after editing plugin files
 
 ## Coding Style & Naming Conventions
