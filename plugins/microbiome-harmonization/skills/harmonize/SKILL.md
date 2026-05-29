@@ -8,6 +8,11 @@ Work with microbiome research data: fetch paper abstracts, retrieve MeSH disease
 
 ## Available Tools
 
+> **Script usage rules — read before proceeding:**
+> - All API calls (NCBI, PubTator3, ENA) **must go through these scripts**. They enforce rate limits (3 RPS for NCBI/PubTator3, 2 RPS for ENA). Never call these APIs directly.
+> - All scripts accept **multiple IDs in a single call** — use batch mode for any list or CSV operation. Do not loop over IDs one at a time.
+> - When unsure about a script's flags or output format, run it with `-h` first.
+
 Four scripts are available via `uv run --with requests python3 ${CLAUDE_PLUGIN_ROOT}/scripts/<script>`:
 
 ### get_abstracts.py — Fetch paper abstracts
