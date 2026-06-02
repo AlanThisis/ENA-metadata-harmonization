@@ -9,6 +9,9 @@ Single PMID/PMCID, print accessions:
 Multiple IDs, print CSV to stdout:
     python scripts/get_ena_accession.py PMC4681099 38243197
 
+Multiple IDs from a CSV column, write output CSV:
+    python scripts/get_ena_accession.py --input-csv papers.csv --id-column pmcid -o accessions.csv
+
 Multiple IDs, write CSV to a file:
     python scripts/get_ena_accession.py PMC4681099 38243197 -o accessions.csv
 """
@@ -18,6 +21,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import json
 import re
 import socket
 import sys
@@ -97,7 +101,6 @@ class NCBIClient:
                     "format": "json",
                 },
             )
-            import json
             data = json.loads(text)
             for record in data.get("records", []):
                 requested = str(record.get("requested-id", "")).upper()
@@ -163,14 +166,43 @@ def unique_preserving_order(values: Iterable[str]) -> list[str]:
     return ordered
 
 
+def load_ids_from_csv(csv_path: str, column: str | None) -> list[str]:
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        headers = list(reader.fieldnames or [])
+        if not headers:
+            raise ValueError(f"CSV file {csv_path!r} appears to be empty.")
+        if column is None:
+            col = headers[0]
+            print(f"  No --id-column specified; using first column: {col!r}", file=sys.stderr)
+        else:
+            col = column
+            if col not in headers:
+                lower_map = {h.lower(): h for h in headers}
+                if col.lower() in lower_map:
+                    col = lower_map[col.lower()]
+                else:
+                    raise ValueError(
+                        f"Column {column!r} not found in {csv_path!r}. "
+                        f"Available columns: {', '.join(headers)}"
+                    )
+        ids = [row[col].strip() for row in reader if (row.get(col) or "").strip()]
+    return ids
+
+
 def fetch_results(ids: list[str]) -> list[Result]:
     client = NCBIClient()
+    total = len(ids)
+    print(f"Fetching ENA accessions for {total} ID(s)...", file=sys.stderr, flush=True)
+
     results = [Result(requested_id=value, input_type=classify_id(value)) for value in ids]
 
     pmcid_values = [result.requested_id.upper() for result in results if result.input_type == "pmcid"]
     pmcid_lookup: dict[str, dict[str, str]] = {}
     if pmcid_values:
+        print(f"  Converting {len(pmcid_values)} PMCID(s) to PMIDs...", file=sys.stderr, end="", flush=True)
         pmcid_lookup = client.convert_pmcids(pmcid_values)
+        print(" done", file=sys.stderr, flush=True)
 
     for result in results:
         if result.input_type == "pmid":
@@ -188,12 +220,19 @@ def fetch_results(ids: list[str]) -> list[Result]:
         [result.pmcid or result.requested_id.upper() for result in results if result.input_type == "pmcid"]
     )
 
-    for pmcid in pmcids_to_fetch:
+    print(f"  Fetching full-text XML for {len(pmcids_to_fetch)} PMCID(s)...", file=sys.stderr, flush=True)
+    for i, pmcid in enumerate(pmcids_to_fetch, 1):
+        print(f"    [{i}/{len(pmcids_to_fetch)}] {pmcid}...", file=sys.stderr, end="", flush=True)
         try:
             xml_text = client.fetch_pmc_fulltext_xml(pmcid)
             accessions = extract_accessions(xml_text)
+            if accessions:
+                print(f" {', '.join(accessions)}", file=sys.stderr, flush=True)
+            else:
+                print(" no ENA accessions found", file=sys.stderr, flush=True)
         except Exception as exc:
             accessions = []
+            print(f" error: {exc}", file=sys.stderr, flush=True)
             error_msg = str(exc)
         else:
             error_msg = ""
@@ -206,6 +245,11 @@ def fetch_results(ids: list[str]) -> list[Result]:
                     result.accessions = "ENA_NOT_FOUND"
                 else:
                     result.error = error_msg
+
+    found = sum(1 for r in results if r.accessions and r.accessions != "ENA_NOT_FOUND")
+    errors = sum(1 for r in results if r.error)
+    suffix = f", {errors} error(s)" if errors else ""
+    print(f"Done: {found}/{total} had ENA accessions{suffix}", file=sys.stderr, flush=True)
 
     return results
 
@@ -220,8 +264,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "ids",
-        nargs="+",
+        nargs="*",
         help="One or more PMIDs or PMCIDs (for example: 38243197 or PMC4681099).",
+    )
+    parser.add_argument(
+        "-i", "--input-csv",
+        metavar="FILE",
+        help="Read IDs from this CSV file instead of (or in addition to) positional arguments.",
+    )
+    parser.add_argument(
+        "--id-column",
+        metavar="COLUMN",
+        help="Column name to read IDs from when using --input-csv. Defaults to the first column.",
     )
     parser.add_argument(
         "-o",
@@ -253,8 +307,20 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    ids = list(args.ids)
+    if args.input_csv:
+        try:
+            csv_ids = load_ids_from_csv(args.input_csv, args.id_column)
+        except (OSError, ValueError) as exc:
+            print(f"Error reading CSV: {exc}", file=sys.stderr)
+            return 1
+        ids = csv_ids + ids
+
+    if not ids:
+        parser.error("Provide at least one ID as a positional argument or via --input-csv.")
+
     try:
-        results = fetch_results(args.ids)
+        results = fetch_results(ids)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

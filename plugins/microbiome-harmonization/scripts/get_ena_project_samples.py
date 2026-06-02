@@ -210,28 +210,40 @@ def build_sample_row(
 
 
 def fetch_rows(project_accession: str, max_samples: int | None = None) -> tuple[list[dict[str, str]], list[str]]:
+    import sys
     client = ENAClient()
+    print(f"Fetching samples for {project_accession}...", file=sys.stderr, flush=True)
     sample_accessions = unique_preserving_order(client.fetch_sample_accessions(project_accession))
     if not sample_accessions:
         raise RuntimeError(f"No sample accessions found for project {project_accession}")
     if max_samples is not None:
         sample_accessions = sample_accessions[:max_samples]
 
+    total = len(sample_accessions)
+    print(f"  Found {total} sample(s).", file=sys.stderr, flush=True)
+
     rows: list[dict[str, str]] = []
     tag_to_column: OrderedDict[str, str] = OrderedDict()
     column_to_tag: dict[str, str] = {}
 
-    for sample_accession in sample_accessions:
+    for i, sample_accession in enumerate(sample_accessions, 1):
+        print(f"  [{i}/{total}] {sample_accession}...", file=sys.stderr, end="", flush=True)
         try:
             sample_xml = client.fetch_sample_xml(sample_accession)
             row = build_sample_row(project_accession, sample_accession, sample_xml, tag_to_column, column_to_tag)
+            print(" done", file=sys.stderr, flush=True)
         except Exception as exc:
             row = {
                 "project_accession": project_accession,
                 "sample_accession": sample_accession,
                 "error": str(exc),
             }
+            print(f" error: {exc}", file=sys.stderr, flush=True)
         rows.append(row)
+
+    errors = sum(1 for r in rows if r.get("error"))
+    suffix = f", {errors} error(s)" if errors else ""
+    print(f"Done: {total - errors}/{total} samples fetched{suffix}", file=sys.stderr, flush=True)
 
     columns = CORE_COLUMNS + [column for column in tag_to_column.values() if column not in CORE_COLUMNS]
     return rows, columns

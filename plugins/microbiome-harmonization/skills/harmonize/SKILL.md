@@ -17,27 +17,39 @@ Four scripts are available via `uv run --with requests python3 ${CLAUDE_PLUGIN_R
 
 ### get_abstracts.py — Fetch paper abstracts
 
-**Usage:** `get_abstracts.py <PMID_or_PMCID> [<PMID_or_PMCID> ...] [-o output.csv]`
+**Usage:**
+```
+get_abstracts.py <PMID_or_PMCID> [...]  [-o output.csv]
+get_abstracts.py --input-csv FILE [--id-column COLUMN] [-o output.csv]
+```
 
-Fetches abstract text from NCBI PubMed/PMC. Single ID prints text to stdout; multiple IDs produce CSV. Run with `-h` for full options.
+Fetches abstract text from NCBI PubMed/PMC. Single ID prints text to stdout; multiple IDs produce CSV. `--input-csv` reads IDs from a CSV column (defaults to first column if `--id-column` is omitted). Progress is printed to stderr. Run with `-h` for full options.
 
 ### get_disease_entities.py — Fetch disease annotations
 
-**Usage:** `get_disease_entities.py <PMID_or_PMCID> [<PMID_or_PMCID> ...] [-o output.csv]`
+**Usage:**
+```
+get_disease_entities.py <PMID_or_PMCID> [...]  [-o output.csv]
+get_disease_entities.py --input-csv FILE [--id-column COLUMN] [-o output.csv]
+```
 
-Retrieves MeSH disease annotations from PubTator3. Single ID prints one disease per line (name<TAB>mesh_id); multiple IDs produce CSV with disease_names and disease_ids (semicolon-separated). Run with `-h` for full options.
+Retrieves MeSH disease annotations from PubTator3. Single ID prints one disease per line (name<TAB>mesh_id); multiple IDs produce CSV with disease_names and disease_ids (semicolon-separated). Progress is printed to stderr. Run with `-h` for full options.
 
 ### get_ena_project_samples.py — Fetch ENA sample metadata
 
 **Usage:** `get_ena_project_samples.py <ENA_ACCESSION> [-o output.csv] [--max-samples N]`
 
-Fetches flattened sample-level metadata from ENA. Outputs project_accession, sample_accession, sample_alias, sample_title, plus any custom SAMPLE_ATTRIBUTE fields. Use `--max-samples N` for quick inspections on large studies. Run with `-h` for full options.
+Fetches flattened sample-level metadata from ENA. Outputs project_accession, sample_accession, sample_alias, sample_title, plus any custom SAMPLE_ATTRIBUTE fields. Use `--max-samples N` for quick inspections on large studies. Per-sample progress is printed to stderr. Run with `-h` for full options.
 
 ### get_ena_accession.py — Extract ENA accessions from papers
 
-**Usage:** `get_ena_accession.py <PMID_or_PMCID> [<PMID_or_PMCID> ...] [-o output.csv]`
+**Usage:**
+```
+get_ena_accession.py <PMID_or_PMCID> [...]  [-o output.csv]
+get_ena_accession.py --input-csv FILE [--id-column COLUMN] [-o output.csv]
+```
 
-Fetches PMC full-text XML and extracts ENA/SRA project accessions via regex. Single ID prints accessions one per line; multiple IDs produce CSV. Run with `-h` for full options.
+Fetches PMC full-text XML and extracts ENA/SRA project accessions via regex. Single ID prints accessions one per line; multiple IDs produce CSV. Per-paper progress is printed to stderr. Run with `-h` for full options.
 
 ---
 
@@ -60,24 +72,16 @@ Ask the user for output format preferences (what columns, where to save) if not 
 
 When you have a CSV with paper IDs and want abstracts without token overhead:
 
-- Ask which column contains the PMC/PMID values
-- Extract that column and pipe to `get_abstracts.py`
-- Run as a background command and report when done (don't read the output into context)
+- Check which column holds the PMC/PMID values (`head -5` the CSV)
+- Pass the CSV directly with `--input-csv` — no need to extract IDs manually
+- Run as a background command so output doesn't load into context
 
-Example (for CSV with PMC IDs in column 2):
 ```bash
-cut -d',' -f2 your_data.csv | tail -n +2 | tr '\n' ' ' | xargs python3 ${CLAUDE_PLUGIN_ROOT}/scripts/get_abstracts.py -o abstracts.csv
+uv run --with requests python3 ${CLAUDE_PLUGIN_ROOT}/scripts/get_abstracts.py \
+  --input-csv papers.csv --id-column pmcid -o abstracts.csv
 ```
 
-Or in Python for more control:
-```python
-python3 << 'EOF'
-import csv, subprocess
-with open('your_data.csv') as f:
-    ids = [row[column_index] for row in csv.reader(f)]
-subprocess.run(['python3', '${CLAUDE_PLUGIN_ROOT}/scripts/get_abstracts.py'] + ids + ['-o', 'abstracts.csv'])
-EOF
-```
+If the column name is unknown, omit `--id-column` and the script will use the first column and tell you which one it picked. Progress is printed to stderr so you can see it running.
 
 ### Find ENA studies from a paper
 
