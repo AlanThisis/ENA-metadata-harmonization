@@ -32,6 +32,7 @@ TOOL_NAME = "ena_metadata_harmonization"
 DEFAULT_REQUESTS_PER_SECOND = 2.0
 MIN_REQUEST_INTERVAL_SECONDS = 1.0 / DEFAULT_REQUESTS_PER_SECOND
 PROJECT_RE = re.compile(r"^[A-Z]{4,}\d+$", re.IGNORECASE)
+XML_BATCH_SIZE = 200
 
 CORE_COLUMNS = [
     "project_accession",
@@ -96,8 +97,8 @@ class ENAClient:
                 sample_accessions.append(accession)
         return sample_accessions
 
-    def fetch_sample_xml(self, sample_accession: str) -> str:
-        response = self._get(f"{ENA_BROWSER_XML_BASE}/{sample_accession}")
+    def fetch_samples_xml_batch(self, sample_accessions: list[str]) -> str:
+        response = self._get(f"{ENA_BROWSER_XML_BASE}/{','.join(sample_accessions)}")
         return response.text
 
 
@@ -153,27 +154,16 @@ def assign_dynamic_column(
     add_value(row, tag_to_column[raw_tag], value)
 
 
-def parse_sample_xml(project_accession: str, sample_xml: str, sample_accession: str) -> dict[str, str]:
-    try:
-        root = ET.fromstring(sample_xml)
-    except ET.ParseError as exc:
-        return {
-            "project_accession": project_accession,
-            "sample_accession": sample_accession,
-            "error": f"XML parse error: {exc}",
-        }
-
-    sample = root.find("./SAMPLE")
-    if sample is None:
-        return {
-            "project_accession": project_accession,
-            "sample_accession": sample_accession,
-            "error": "SAMPLE element not found",
-        }
-
+def parse_sample_element(
+    project_accession: str,
+    sample: ET.Element,
+    fallback_accession: str,
+    tag_to_column: OrderedDict[str, str],
+    column_to_tag: dict[str, str],
+) -> dict[str, str]:
     row: dict[str, str] = {
         "project_accession": project_accession,
-        "sample_accession": sample.get("accession", sample_accession),
+        "sample_accession": sample.get("accession", fallback_accession),
         "sample_alias": sample.get("alias", ""),
         "center_name": sample.get("center_name", ""),
         "sample_title": sample.findtext("./TITLE", default="").strip(),
@@ -184,29 +174,15 @@ def parse_sample_xml(project_accession: str, sample_xml: str, sample_accession: 
         "description": sample.findtext("./DESCRIPTION", default="").strip(),
         "error": "",
     }
-
-    return row, sample
-
-
-def build_sample_row(
-    project_accession: str,
-    sample_accession: str,
-    sample_xml: str,
-    tag_to_column: OrderedDict[str, str],
-    column_to_tag: dict[str, str],
-) -> dict[str, str]:
-    parsed = parse_sample_xml(project_accession, sample_xml, sample_accession)
-    if isinstance(parsed, dict):
-        return parsed
-
-    row, sample = parsed
-
     for sample_attribute in sample.findall("./SAMPLE_ATTRIBUTES/SAMPLE_ATTRIBUTE"):
         raw_tag = sample_attribute.findtext("./TAG", default="")
         value = sample_attribute.findtext("./VALUE", default="")
         assign_dynamic_column(raw_tag, value, row, tag_to_column, column_to_tag)
-
     return row
+
+
+def chunked(values: list[str], size: int) -> list[list[str]]:
+    return [values[i:i + size] for i in range(0, len(values), size)]
 
 
 def fetch_rows(project_accession: str, max_samples: int | None = None) -> tuple[list[dict[str, str]], list[str]]:
@@ -220,26 +196,37 @@ def fetch_rows(project_accession: str, max_samples: int | None = None) -> tuple[
         sample_accessions = sample_accessions[:max_samples]
 
     total = len(sample_accessions)
-    print(f"  Found {total} sample(s).", file=sys.stderr, flush=True)
+    batches = chunked(sample_accessions, XML_BATCH_SIZE)
+    print(f"  Found {total} sample(s), fetching in {len(batches)} batch(es).", file=sys.stderr, flush=True)
 
     rows: list[dict[str, str]] = []
     tag_to_column: OrderedDict[str, str] = OrderedDict()
     column_to_tag: dict[str, str] = {}
+    fetched = 0
 
-    for i, sample_accession in enumerate(sample_accessions, 1):
-        print(f"  [{i}/{total}] {sample_accession}...", file=sys.stderr, end="", flush=True)
+    for batch_i, batch in enumerate(batches, 1):
+        start = (batch_i - 1) * XML_BATCH_SIZE + 1
+        end = start + len(batch) - 1
+        print(f"  Batch [{batch_i}/{len(batches)}] samples {start}–{end}...", file=sys.stderr, end="", flush=True)
         try:
-            sample_xml = client.fetch_sample_xml(sample_accession)
-            row = build_sample_row(project_accession, sample_accession, sample_xml, tag_to_column, column_to_tag)
-            print(" done", file=sys.stderr, flush=True)
+            batch_xml = client.fetch_samples_xml_batch(batch)
+            root = ET.fromstring(batch_xml)
+            sample_elements = root.findall("./SAMPLE")
+            by_accession = {el.get("accession", ""): el for el in sample_elements}
+            print(f" got {len(sample_elements)}", file=sys.stderr, flush=True)
         except Exception as exc:
-            row = {
-                "project_accession": project_accession,
-                "sample_accession": sample_accession,
-                "error": str(exc),
-            }
             print(f" error: {exc}", file=sys.stderr, flush=True)
-        rows.append(row)
+            for acc in batch:
+                rows.append({"project_accession": project_accession, "sample_accession": acc, "error": str(exc)})
+            continue
+
+        for acc in batch:
+            sample_el = by_accession.get(acc)
+            if sample_el is None:
+                rows.append({"project_accession": project_accession, "sample_accession": acc, "error": "not returned in batch XML"})
+            else:
+                rows.append(parse_sample_element(project_accession, sample_el, acc, tag_to_column, column_to_tag))
+        fetched += len(sample_elements)
 
     errors = sum(1 for r in rows if r.get("error"))
     suffix = f", {errors} error(s)" if errors else ""
