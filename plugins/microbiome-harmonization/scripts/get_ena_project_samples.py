@@ -28,9 +28,11 @@ import argparse
 import csv
 import re
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -44,6 +46,7 @@ TOOL_NAME = "ena_metadata_harmonization"
 
 DEFAULT_REQUESTS_PER_SECOND = 2.0
 MIN_REQUEST_INTERVAL_SECONDS = 1.0 / DEFAULT_REQUESTS_PER_SECOND
+CNCB_MAX_WORKERS = 20
 # CRA prefix is only 3 chars, so allow 2+ letter prefixes
 PROJECT_RE = re.compile(r"^[A-Z]{2,}\d+$", re.IGNORECASE)
 XML_BATCH_SIZE = 200
@@ -83,19 +86,24 @@ class ENAClient:
     def __init__(self, tool: str = TOOL_NAME) -> None:
         self.tool = tool
         self._last_request_time = 0.0
+        self._throttle_lock = threading.Lock()
 
     def _throttle(self) -> None:
-        elapsed = time.monotonic() - self._last_request_time
-        if elapsed < MIN_REQUEST_INTERVAL_SECONDS:
-            time.sleep(MIN_REQUEST_INTERVAL_SECONDS - elapsed)
+        with self._throttle_lock:
+            elapsed = time.monotonic() - self._last_request_time
+            if elapsed < MIN_REQUEST_INTERVAL_SECONDS:
+                time.sleep(MIN_REQUEST_INTERVAL_SECONDS - elapsed)
+            self._last_request_time = time.monotonic()
 
     def _get(
         self,
         url: str,
         params: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
+        throttle: bool = True,
     ) -> requests.Response:
-        self._throttle()
+        if throttle:
+            self._throttle()
         merged_headers = {"User-Agent": self.tool}
         if headers:
             merged_headers.update(headers)
@@ -113,7 +121,6 @@ class ENAClient:
         except requests.RequestException as exc:
             raise RuntimeError(f"Request failed for {url}: {exc}") from exc
 
-        self._last_request_time = time.monotonic()
         return response
 
     # ── ENA ──────────────────────────────────────────────────────────────────
@@ -161,7 +168,7 @@ class ENAClient:
 
     def fetch_gwh_biosample(self, samc_accession: str) -> dict:
         """Fetch BioSample attributes from the CNCB GWH API."""
-        response = self._get(f"{GWH_API_BASE}/bioSample/{samc_accession}")
+        response = self._get(f"{GWH_API_BASE}/bioSample/{samc_accession}", throttle=False)
         return response.json()
 
 
@@ -373,21 +380,49 @@ def _fetch_cncb_rows(
         samc_list = samc_list[:max_samples]
 
     total = len(samc_list)
-    print(f"  Found {total} sample(s), fetching via GWH API...", file=sys.stderr, flush=True)
+    print(
+        f"  Found {total} sample(s), fetching via GWH API ({CNCB_MAX_WORKERS} workers)...",
+        file=sys.stderr, flush=True,
+    )
 
-    rows: list[dict[str, str]] = []
-    for i, samc in enumerate(samc_list, 1):
-        print(f"  [{i}/{total}] {samc}...", file=sys.stderr, end="", flush=True)
+    # Each thread needs its own tag_to_column / column_to_tag state; merge after.
+    # Results keyed by samc to restore original order.
+    results: dict[str, dict[str, str]] = {}
+    per_thread_columns: list[tuple[OrderedDict, dict]] = []
+    lock = threading.Lock()
+    counter = [0]
+
+    def fetch_one(samc: str) -> None:
+        local_t2c: OrderedDict[str, str] = OrderedDict()
+        local_c2t: dict[str, str] = {}
         try:
             data = client.fetch_gwh_biosample(samc)
             if data.get("message") != "SUCCESS":
                 raise RuntimeError(f"GWH API returned: {data.get('message')}")
-            rows.append(parse_gwh_biosample(project_accession, data, samc, tag_to_column, column_to_tag))
-            print(" ok", file=sys.stderr, flush=True)
+            row = parse_gwh_biosample(project_accession, data, samc, local_t2c, local_c2t)
         except Exception as exc:
-            print(f" error: {exc}", file=sys.stderr, flush=True)
-            rows.append({"project_accession": project_accession, "sample_accession": samc, "error": str(exc)})
+            row = {"project_accession": project_accession, "sample_accession": samc, "error": str(exc)}
+        with lock:
+            results[samc] = row
+            per_thread_columns.append((local_t2c, local_c2t))
+            counter[0] += 1
+            n = counter[0]
+            status = "ok" if not row.get("error") else f"error: {row['error']}"
+            print(f"  [{n}/{total}] {samc} {status}", file=sys.stderr, flush=True)
 
+    with ThreadPoolExecutor(max_workers=CNCB_MAX_WORKERS) as pool:
+        futures = [pool.submit(fetch_one, samc) for samc in samc_list]
+        for f in as_completed(futures):
+            f.result()  # re-raise any unexpected exception
+
+    # Merge per-thread column maps into the shared ones, preserving first-seen order
+    for local_t2c, local_c2t in per_thread_columns:
+        for raw_tag, col in local_t2c.items():
+            if raw_tag not in tag_to_column:
+                tag_to_column[raw_tag] = col
+                column_to_tag[col] = raw_tag
+
+    rows = [results[samc] for samc in samc_list]
     errors = sum(1 for r in rows if r.get("error"))
     suffix = f", {errors} error(s)" if errors else ""
     print(f"Done: {total - errors}/{total} samples fetched{suffix}", file=sys.stderr, flush=True)
