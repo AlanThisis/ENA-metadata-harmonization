@@ -124,70 +124,80 @@ Find the column whose values match `^(PRJEB|PRJCA|CRA|ERP)\d+`. Name the output 
 mkdir -p input_stem_metadata   # replace input_stem with the CSV filename without extension
 ```
 
-**Step 2 — Fetch metadata per accession**
+**Step 2 — Fetch metadata for all accessions in one call**
 
-Extract the accession column and run the script for each unique value. Redirect stderr to a log file so progress doesn't flood context:
+Pass the CSV directly — the script auto-detects the accession column and concatenates all studies into one output file. Redirect stderr to a log file so progress doesn't flood context:
 
 ```bash
-# Extract unique accessions (adjust column number as needed)
-tail -n +2 input.csv | cut -d, -f<N> | sort -u > /tmp/accessions.txt
+uv run --with requests python3 ${CLAUDE_PLUGIN_ROOT}/scripts/get_ena_project_samples.py \
+  --input-csv input.csv \
+  -o input_stem_metadata/all_samples.csv \
+  2>input_stem_metadata/fetch.log
+```
 
-# Fetch each one — output goes to individual files in the metadata dir
-while IFS= read -r acc; do
-  uv run --with requests python3 ${CLAUDE_PLUGIN_ROOT}/scripts/get_ena_project_samples.py \
-    "$acc" -o "input_stem_metadata/${acc}.csv" 2>>"input_stem_metadata/fetch.log"
-done < /tmp/accessions.txt
+If the accession column has an ambiguous name, specify it explicitly:
+
+```bash
+uv run --with requests python3 ${CLAUDE_PLUGIN_ROOT}/scripts/get_ena_project_samples.py \
+  --input-csv input.csv --id-column study_accession \
+  -o input_stem_metadata/all_samples.csv \
+  2>input_stem_metadata/fetch.log
+```
+
+Check progress without loading the log into context:
+
+```bash
+tail -5 input_stem_metadata/fetch.log
 ```
 
 **Step 3 — Stage 1 phenotype extraction (regex on column names)**
 
-For each metadata CSV, run shell one-liners against column headers only. This is fast and produces zero context overhead.
+All studies are now in one file. Run shell one-liners against the header only — zero context overhead:
 
 ```bash
-for f in input_stem_metadata/*.csv; do
-  echo "=== $f ==="
-  # age columns
-  head -1 "$f" | tr ',' '\n' | grep -inE '\bage\b|_age$|^age_|host_age'
-  # sex columns
-  head -1 "$f" | tr ',' '\n' | grep -inE '\b(sex|gender)\b|biological_sex|host_sex'
-  # disease columns (Stage 1 — explicit names)
-  head -1 "$f" | tr ',' '\n' | grep -inE '\b(disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity)\b'
-done
+F=input_stem_metadata/all_samples.csv
+# age columns
+head -1 "$F" | tr ',' '\n' | grep -inE '\bage\b|_age$|^age_|host_age'
+# sex columns
+head -1 "$F" | tr ',' '\n' | grep -inE '\b(sex|gender)\b|biological_sex|host_sex'
+# disease columns
+head -1 "$F" | tr ',' '\n' | grep -inE '\b(disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity)\b'
 ```
 
-Record which column names matched for each file. If age and sex are found, extract them now:
+Record which column names matched. If age and sex are found, extract them now:
 
 ```bash
 python3 -c "
-import csv, sys
-f = sys.argv[1]
-rows = list(csv.DictReader(open(f)))
-hdr = rows[0].keys() if rows else []
+import csv
+rows = list(csv.DictReader(open('input_stem_metadata/all_samples.csv')))
+hdr = list(rows[0].keys()) if rows else []
 age_col = next((c for c in hdr if 'age' in c.lower()), None)
 sex_col = next((c for c in hdr if c.lower() in ('sex','gender','host_sex','biological_sex')), None)
 for r in rows:
-    print(r.get('sample_accession',''), r.get(age_col,'') if age_col else '', r.get(sex_col,'') if sex_col else '')
-" input_stem_metadata/<ACC>.csv
+    print(r.get('project_accession',''), r.get('sample_accession',''),
+          r.get(age_col,'') if age_col else '',
+          r.get(sex_col,'') if sex_col else '')
+"
 ```
 
 **Step 4 — Stage 2 disease review (controlled file read for false negatives)**
 
 Only reach for this when Stage 1 found **no** disease column. Do not read the full CSV.
 
-4a. Read **only the header row** of the file and list all column names not yet matched:
+4a. Read **only the header row** and list all unmatched column names:
 
 ```bash
-head -1 input_stem_metadata/<ACC>.csv | tr ',' '\n' | nl
+head -1 input_stem_metadata/all_samples.csv | tr ',' '\n' | nl
 ```
 
 Scan that list yourself for anything that could encode disease or group membership: `host_phenotype`, `subject_group`, `clinical_status`, `study_condition`, `hmp_body_site`, disease abbreviations (`crc`, `ibd`, `cd`, `uc`), columns ending in `_type`, `_group`, `_status`.
 
-4b. If you spot one or two suspicious columns, peek at their first few distinct values only — do not read whole rows:
+4b. If you spot a suspicious column, peek at its first few distinct values only — do not read whole rows:
 
 ```bash
 python3 -c "
 import csv
-rows = list(csv.DictReader(open('input_stem_metadata/<ACC>.csv')))
+rows = list(csv.DictReader(open('input_stem_metadata/all_samples.csv')))
 col = '<SUSPICIOUS_COLUMN>'
 vals = list(dict.fromkeys(r[col] for r in rows if r.get(col)))[:5]
 print(vals)
@@ -209,7 +219,7 @@ After processing all accessions, write a single output CSV with one row per samp
 | `disease` | matched disease column or blank |
 | `disease_col_name` | actual column name used, for traceability |
 
-Save to `input_stem_metadata/phenotypes.csv`. Report a one-line summary per study: how many samples, which columns were used for each phenotype field, and how many samples have blanks for disease.
+Save to `input_stem_metadata/phenotype_coverage.csv`. Report a one-line summary per study: how many samples, which columns were used for each phenotype field, and how many samples have blanks for disease.
 
 ---
 
