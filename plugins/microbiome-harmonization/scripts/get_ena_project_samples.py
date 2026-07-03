@@ -128,6 +128,20 @@ class ENAClient:
     # ── ENA ──────────────────────────────────────────────────────────────────
 
     def fetch_sample_accessions(self, project_accession: str) -> list[str]:
+        # Primary: result=sample with study_accession (works for most PRJEB/PRJNA)
+        accessions = self._query_ena_samples(project_accession)
+        if accessions:
+            return accessions
+        # Fallback: result=read_run, trying both study_accession and
+        # secondary_study_accession (catches SRP*, ERP*, DRP* aliases that are
+        # not indexed under result=sample)
+        print(
+            "  result=sample returned 0; trying read_run fallback...",
+            file=sys.stderr, flush=True,
+        )
+        return self._query_ena_samples_via_runs(project_accession)
+
+    def _query_ena_samples(self, project_accession: str) -> list[str]:
         response = self._get(
             ENA_PORTAL_SEARCH_BASE,
             {
@@ -140,6 +154,29 @@ class ENAClient:
         )
         records = response.json()
         return [str(r.get("sample_accession", "")).strip() for r in records if r.get("sample_accession")]
+
+    def _query_ena_samples_via_runs(self, project_accession: str) -> list[str]:
+        """Extract unique sample accessions from read_run records.
+        Tries both study_accession and secondary_study_accession fields."""
+        for field in ("study_accession", "secondary_study_accession"):
+            response = self._get(
+                ENA_PORTAL_SEARCH_BASE,
+                {
+                    "result": "read_run",
+                    "query": f'{field}="{project_accession}"',
+                    "fields": "sample_accession",
+                    "format": "json",
+                    "limit": "0",
+                },
+            )
+            records = response.json()
+            accessions = list(dict.fromkeys(
+                str(r.get("sample_accession", "")).strip()
+                for r in records if r.get("sample_accession")
+            ))
+            if accessions:
+                return accessions
+        return []
 
     def fetch_samples_xml_batch(self, sample_accessions: list[str]) -> str:
         response = self._get(f"{ENA_BROWSER_XML_BASE}/{','.join(sample_accessions)}")
