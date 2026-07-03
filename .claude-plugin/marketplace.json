@@ -8,7 +8,7 @@
     {
       "name": "microbiome-harmonization",
       "source": "./plugins/microbiome-harmonization",
-      "description": "Classify ENA microbiome samples into labeled cohorts (disease, control, or other) given a paper ID and ENA project accession."
+      "description": "Fetch and harmonize microbiome study metadata from ENA (PRJEB/ERP) and CNCB-GSA (PRJCA/CRA). Extract abstracts, disease annotations, and sample-level attributes. Classify samples into disease/control cohorts."
     }
   ]
 }

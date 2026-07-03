@@ -1,5 +1,6 @@
 ---
-description: "Fetch and analyze microbiome metadata from papers and ENA studies. Extract abstracts, disease annotations, sample metadata, and ENA accessions. Classify samples into cohorts or inspect metadata directly."
+name: harmonize
+description: "Fetch and analyze microbiome metadata from papers and studies (ENA, CNCB-GSA). Extract abstracts, disease annotations, sample metadata, and project accessions. Classify samples into cohorts or inspect metadata directly."
 ---
 
 # Microbiome Metadata
