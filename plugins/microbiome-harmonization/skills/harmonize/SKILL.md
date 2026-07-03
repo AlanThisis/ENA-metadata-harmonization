@@ -37,16 +37,21 @@ Retrieves MeSH disease annotations from PubTator3. Single ID prints one disease 
 
 ### get_ena_project_samples.py — Fetch sample metadata
 
-**Usage:** `get_ena_project_samples.py <ACCESSION> [-o output.csv] [--max-samples N]`
+**Usage:**
+```
+get_ena_project_samples.py <ACCESSION> [-o output.csv] [--max-samples N]
+get_ena_project_samples.py --input-csv FILE [--id-column COLUMN] [-o output.csv]
+```
 
 Fetches flattened sample-level metadata and writes CSV. Database is auto-detected from the accession prefix:
 
 | Prefix | Database | Notes |
 |--------|----------|-------|
 | PRJEB, ERP, ERS, SAMEA | ENA | Batch XML, 200 samples/request |
+| PRJNA, SRP, DRP | ENA | Primary query + `read_run` fallback (~28% need fallback) |
 | PRJCA, CRA | CNCB-GSA | HTML scrape → GWH API per sample, parallelized |
 
-Outputs `project_accession`, `sample_accession`, `sample_alias`, `sample_title`, plus any study-specific attribute columns. Use `--max-samples N` for quick inspections on large studies. Per-sample progress is printed to stderr. Run with `-h` for full options.
+`--input-csv` reads accessions from a CSV (column auto-detected or set with `--id-column`) and concatenates all studies into one output. Outputs `project_accession`, `sample_accession`, `sample_alias`, `sample_title`, plus any study-specific attribute columns. Use `--max-samples N` for quick inspections on large studies. Per-sample progress is printed to stderr. Run with `-h` for full options.
 
 ### get_ena_accession.py — Extract ENA accessions from papers
 
@@ -152,74 +157,86 @@ tail -5 input_stem_metadata/fetch.log
 
 **Step 3 — Stage 1 phenotype extraction (regex on column names)**
 
-All studies are now in one file. Run shell one-liners against the header only — zero context overhead:
-
-```bash
-F=input_stem_metadata/all_samples.csv
-# age columns
-head -1 "$F" | tr ',' '\n' | grep -inE '\bage\b|_age$|^age_|host_age'
-# sex columns
-head -1 "$F" | tr ',' '\n' | grep -inE '\b(sex|gender)\b|biological_sex|host_sex'
-# disease columns
-head -1 "$F" | tr ',' '\n' | grep -inE '\b(disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity)\b'
-```
-
-Record which column names matched. If age and sex are found, extract them now:
+All studies are now in one file. Run this Python one-liner against the header only — no grep `\b` issues, zero context overhead:
 
 ```bash
 python3 -c "
-import csv
-rows = list(csv.DictReader(open('input_stem_metadata/all_samples.csv')))
-hdr = list(rows[0].keys()) if rows else []
-age_col = next((c for c in hdr if 'age' in c.lower()), None)
-sex_col = next((c for c in hdr if c.lower() in ('sex','gender','host_sex','biological_sex')), None)
-for r in rows:
-    print(r.get('project_accession',''), r.get('sample_accession',''),
-          r.get(age_col,'') if age_col else '',
-          r.get(sex_col,'') if sex_col else '')
+import csv, re
+AGE_RE = re.compile(r'^age$|^age_|_age$|host_age', re.I)
+SEX_RE = re.compile(r'^sex$|^gender$|biological_sex|host_sex', re.I)
+DIS_RE = re.compile(r'disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity', re.I)
+with open('input_stem_metadata/all_samples.csv') as f:
+    cols = next(csv.reader(f))
+print('AGE:', [c for c in cols if AGE_RE.search(c)])
+print('SEX:', [c for c in cols if SEX_RE.search(c)])
+print('DIS:', [c for c in cols if DIS_RE.search(c)])
 "
 ```
+
+Note the column names. If all three have matches, skip Stage 2 and go directly to Step 5.
 
 **Step 4 — Stage 2 disease review (controlled file read for false negatives)**
 
 Only reach for this when Stage 1 found **no** disease column. Do not read the full CSV.
 
-4a. Read **only the header row** and list all unmatched column names:
+4a. Read **only the header row** and list all column names with indices:
 
 ```bash
 head -1 input_stem_metadata/all_samples.csv | tr ',' '\n' | nl
 ```
 
-Scan that list yourself for anything that could encode disease or group membership: `host_phenotype`, `subject_group`, `clinical_status`, `study_condition`, `hmp_body_site`, disease abbreviations (`crc`, `ibd`, `cd`, `uc`), columns ending in `_type`, `_group`, `_status`.
+Scan the list for columns that could encode disease or group membership: names containing `host_phenotype`, `subject_group`, `clinical_status`, `study_condition`, `body_site`, disease abbreviations (`crc`, `ibd`, `cd`, `uc`, `t2d`), or columns ending in `_type`, `_group`, `_status`. This is LLM judgment — look for anything that a biologist might use to distinguish cases from controls.
 
-4b. If you spot a suspicious column, peek at its first few distinct values only — do not read whole rows:
+4b. For each suspicious column, peek at its first few distinct values — do not read whole rows:
 
 ```bash
 python3 -c "
 import csv
-rows = list(csv.DictReader(open('input_stem_metadata/all_samples.csv')))
-col = '<SUSPICIOUS_COLUMN>'
-vals = list(dict.fromkeys(r[col] for r in rows if r.get(col)))[:5]
-print(vals)
+with open('input_stem_metadata/all_samples.csv') as f:
+    rows = list(csv.DictReader(f))
+col = 'SUSPICIOUS_COLUMN_NAME'
+print(list(dict.fromkeys(r[col] for r in rows if r.get(col)))[:5])
 "
 ```
 
-If those values confirm disease signal, record the column. If nothing surfaces after this pass, leave `disease` blank — do not guess.
+If those values confirm disease signal (e.g. `['CRC', 'Healthy', 'CRC', 'Healthy', 'IBD']`), note the column name — you will use it in Step 5. If nothing surfaces after this pass, leave `disease` blank — do not guess.
 
 **Step 5 — Produce the combined phenotype table**
 
-After processing all accessions, write a single output CSV with one row per sample:
+Run this command to write `phenotype_coverage.csv`. It auto-detects columns using the same patterns as Stage 1. If Stage 2 found a disease column that Stage 1 missed, replace the `dis_col = next(...)` line with `dis_col = 'your_column_name'` before running:
 
-| Column | Source |
-|--------|--------|
-| `study_accession` | input CSV |
-| `sample_accession` | metadata CSV |
-| `age` | matched age column, raw value |
-| `sex` | matched sex column, normalized to `male`/`female`/blank |
-| `disease` | matched disease column or blank |
-| `disease_col_name` | actual column name used, for traceability |
+```bash
+python3 -c "
+import csv, re
+AGE_RE = re.compile(r'^age$|^age_|_age$|host_age', re.I)
+SEX_RE = re.compile(r'^sex$|^gender$|biological_sex|host_sex', re.I)
+DIS_RE = re.compile(r'disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity', re.I)
+SEX_MAP = {'m':'male','male':'male','boy':'male','1':'male',
+           'f':'female','female':'female','girl':'female','2':'female'}
+with open('input_stem_metadata/all_samples.csv') as fh:
+    rows = list(csv.DictReader(fh))
+cols = list(rows[0].keys()) if rows else []
+age_col = next((c for c in cols if AGE_RE.search(c)), None)
+sex_col = next((c for c in cols if SEX_RE.search(c)), None)
+dis_col = next((c for c in cols if DIS_RE.search(c)), None)
+# If Stage 2 found a disease column not matched above, uncomment and set:
+# dis_col = 'your_column_name'
+with open('input_stem_metadata/phenotype_coverage.csv', 'w', newline='') as fh:
+    w = csv.DictWriter(fh, fieldnames=['study_accession','sample_accession','age','sex','disease','disease_col_name'])
+    w.writeheader()
+    for r in rows:
+        sex_raw = (r.get(sex_col,'') if sex_col else '').lower().strip()
+        w.writerow({'study_accession':r.get('project_accession',''),
+            'sample_accession':r.get('sample_accession',''),
+            'age':r.get(age_col,'') if age_col else '',
+            'sex':SEX_MAP.get(sex_raw,''),
+            'disease':r.get(dis_col,'') if dis_col else '',
+            'disease_col_name':dis_col or ''})
+print(f'Done: {len(rows)} rows  age={age_col!r}  sex={sex_col!r}  disease={dis_col!r}')
+"
+```
 
-Save to `input_stem_metadata/phenotype_coverage.csv`. Report a one-line summary per study: how many samples, which columns were used for each phenotype field, and how many samples have blanks for disease.
+After it prints, report a one-line summary per study: how many samples, which columns were used, and how many samples have a blank disease field.
 
 ---
 
@@ -318,11 +335,11 @@ Use the paper's abstract to infer group structure when metadata alone is insuffi
 
 Extract `age`, `sex`, and `disease` when present. Use the two-stage approach — regex first, controlled file read second — as described in the "Extract phenotype metadata from a CSV of accessions" use case above. Never read a full metadata CSV into context.
 
-**Age:** Regex: `\bage\b|_age$|^age_|host_age`. Record raw value; note unit if the column name implies it (e.g., `age_months`). Use `<min>-<max>` if the value is a range.
+**Age:** Pattern: `^age$|^age_|_age$|host_age` (case-insensitive, Python `re`). Record raw value; note unit if the column name implies it (e.g., `age_months`). Use `<min>-<max>` if the value is a range.
 
-**Sex:** Regex: `\b(sex|gender)\b|biological_sex|host_sex`. Normalize values: `M`/`male`/`boy` → `male`; `F`/`female`/`girl` → `female`; anything else → blank.
+**Sex:** Pattern: `^sex$|^gender$|biological_sex|host_sex` (case-insensitive). Normalize values: `M`/`male`/`boy`/`1` → `male`; `F`/`female`/`girl`/`2` → `female`; anything else → blank.
 
-**Disease:** Stage 1 regex: `\b(disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity)\b`. If no match, do Stage 2 (header scan + value peek on suspicious columns). Capture the specific disease term (e.g., `colorectal cancer`, `inflammatory bowel disease`). Leave blank if nothing surfaces after both stages.
+**Disease:** Stage 1 pattern: `disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity` (case-insensitive substring match — these terms don't appear as substrings in unrelated column names, so no word-boundary anchors needed). If no match, do Stage 2 (header scan + value peek on suspicious columns). Capture the specific disease term (e.g., `colorectal cancer`, `inflammatory bowel disease`). Leave blank if nothing surfaces after both stages.
 
 Sex is almost always caught by Stage 1. Disease often needs Stage 2 — always do it before concluding disease is absent.
 
