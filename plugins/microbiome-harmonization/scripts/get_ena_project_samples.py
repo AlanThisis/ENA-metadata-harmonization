@@ -12,14 +12,16 @@ CNCB-GSA flow:
 
 Examples
 --------
-Print CSV to stdout:
+Single accession, print CSV to stdout:
     python scripts/get_ena_project_samples.py PRJEB46665
     python scripts/get_ena_project_samples.py CRA000112
-    python scripts/get_ena_project_samples.py PRJCA000246
 
-Write CSV to a file:
-    python scripts/get_ena_project_samples.py PRJEB46665 -o samples.csv
+Single accession, write to file:
     python scripts/get_ena_project_samples.py PRJCA000246 -o samples.csv
+
+Batch from CSV (accession column auto-detected; all studies concatenated):
+    python scripts/get_ena_project_samples.py --input-csv papers.csv -o all_samples.csv
+    python scripts/get_ena_project_samples.py --input-csv papers.csv --id-column study_acc -o all_samples.csv
 """
 
 from __future__ import annotations
@@ -429,6 +431,52 @@ def _fetch_cncb_rows(
     return rows
 
 
+# ── CSV input helper ──────────────────────────────────────────────────────────
+
+
+def load_accessions_from_csv(csv_path: str, column: str | None) -> list[str]:
+    """Read project accessions from a CSV file.
+
+    If *column* is None, auto-detects the first column whose values look like
+    project accessions (match PROJECT_RE and a known DB prefix).
+    """
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        headers = list(reader.fieldnames or [])
+        if not headers:
+            raise ValueError(f"CSV file {csv_path!r} appears to be empty.")
+        rows = list(reader)
+
+    if column is not None:
+        col = column
+        if col not in headers:
+            lower_map = {h.lower(): h for h in headers}
+            if col.lower() in lower_map:
+                col = lower_map[col.lower()]
+            else:
+                raise ValueError(
+                    f"Column {column!r} not found in {csv_path!r}. "
+                    f"Available columns: {', '.join(headers)}"
+                )
+    else:
+        # Auto-detect: first column where >50% of non-empty values are accessions
+        col = None
+        for h in headers:
+            vals = [r[h].strip() for r in rows if (r.get(h) or "").strip()]
+            if not vals:
+                continue
+            hits = sum(1 for v in vals if PROJECT_RE.fullmatch(v.upper()) and detect_database(v) in ("ena", "cncb"))
+            if hits / len(vals) >= 0.5:
+                col = h
+                break
+        if col is None:
+            col = headers[0]
+        print(f"  Auto-detected accession column: {col!r}", file=sys.stderr, flush=True)
+
+    accessions = [r[col].strip() for r in rows if (r.get(col) or "").strip()]
+    return list(dict.fromkeys(accessions))  # deduplicate, preserve order
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
@@ -468,12 +516,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Fetch sample metadata for a project/study accession and flatten to CSV. "
-            "Database is auto-detected: ENA (PRJEB/ERP) or CNCB-GSA (PRJCA/CRA)."
+            "Database is auto-detected: ENA (PRJEB/ERP) or CNCB-GSA (PRJCA/CRA). "
+            "Multiple accessions via --input-csv are concatenated into one output."
         ),
     )
     parser.add_argument(
         "project_accession",
+        nargs="?",
         help="Project/study accession, e.g. PRJEB46665, CRA000112, PRJCA000246.",
+    )
+    parser.add_argument(
+        "-i", "--input-csv",
+        help="CSV file containing accessions. Accession column is auto-detected or set with --id-column.",
+    )
+    parser.add_argument(
+        "--id-column",
+        help="Column name to read accessions from when using --input-csv. Defaults to auto-detect.",
     )
     parser.add_argument(
         "-o",
@@ -483,7 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-samples",
         type=int,
-        help="Only fetch the first N samples. Useful for quick tests on large studies.",
+        help="Only fetch the first N samples per accession. Useful for quick tests.",
     )
     return parser
 
@@ -491,22 +549,56 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    project_accession = args.project_accession.strip().upper()
 
-    if not PROJECT_RE.fullmatch(project_accession):
-        print(f"Error: invalid project accession: {args.project_accession!r}", file=sys.stderr)
-        return 1
     if args.max_samples is not None and args.max_samples <= 0:
         print("Error: --max-samples must be a positive integer", file=sys.stderr)
         return 1
 
-    try:
-        rows, columns = fetch_rows(project_accession, max_samples=args.max_samples)
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+    # Resolve accession list
+    if args.input_csv:
+        if args.project_accession:
+            parser.error("Provide either a positional accession or --input-csv, not both.")
+        try:
+            accessions = load_accessions_from_csv(args.input_csv, args.id_column)
+        except Exception as exc:
+            print(f"Error reading input CSV: {exc}", file=sys.stderr)
+            return 1
+        if not accessions:
+            print("Error: no accessions found in input CSV.", file=sys.stderr)
+            return 1
+    elif args.project_accession:
+        accessions = [args.project_accession.strip().upper()]
+    else:
+        parser.error("Provide a project accession or --input-csv.")
+
+    # Validate all accessions upfront
+    for raw in accessions:
+        acc = raw.strip().upper()
+        if not PROJECT_RE.fullmatch(acc):
+            print(f"Error: invalid project accession: {raw!r}", file=sys.stderr)
+            return 1
+
+    # Fetch and concatenate
+    all_rows: list[dict[str, str]] = []
+    all_columns: list[str] = list(CORE_COLUMNS)
+
+    for raw in accessions:
+        acc = raw.strip().upper()
+        try:
+            rows, columns = fetch_rows(acc, max_samples=args.max_samples)
+        except Exception as exc:
+            print(f"Error fetching {acc}: {exc}", file=sys.stderr)
+            continue
+        all_rows.extend(rows)
+        for col in columns:
+            if col not in all_columns:
+                all_columns.append(col)
+
+    if not all_rows:
+        print("Error: no rows fetched.", file=sys.stderr)
         return 1
 
-    write_csv(rows, columns, args.output)
+    write_csv(all_rows, all_columns, args.output)
     return 0
 
 
