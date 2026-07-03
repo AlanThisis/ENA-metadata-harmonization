@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
-"""Fetch ENA sample metadata for a study/project accession and write CSV.
+"""Fetch sample metadata for a project/study accession and write CSV.
+
+Database is auto-detected from the accession prefix:
+  ENA:      PRJEB, ERP, ERS, SAMEA  → EBI ENA APIs (XML batch, 200/req)
+  CNCB-GSA: PRJCA, CRA              → CNCB browse pages (HTML) + GWH BioSample API
+
+CNCB-GSA flow:
+  CRA...  → scrape gsa/browse/CRA to get PRJCA → scrape bioproject/browse/PRJCA
+            for full SAMC list → GWH API /bioSample/SAMC per sample
+  PRJCA...→ scrape bioproject/browse/PRJCA for SAMC list → GWH API per sample
 
 Examples
 --------
 Print CSV to stdout:
     python scripts/get_ena_project_samples.py PRJEB46665
+    python scripts/get_ena_project_samples.py CRA000112
+    python scripts/get_ena_project_samples.py PRJCA000246
 
 Write CSV to a file:
     python scripts/get_ena_project_samples.py PRJEB46665 -o samples.csv
+    python scripts/get_ena_project_samples.py PRJCA000246 -o samples.csv
 """
 
 from __future__ import annotations
@@ -25,14 +37,23 @@ import requests
 
 ENA_PORTAL_SEARCH_BASE = "https://www.ebi.ac.uk/ena/portal/api/search"
 ENA_BROWSER_XML_BASE = "https://www.ebi.ac.uk/ena/browser/api/xml"
+CNCB_GSA_BROWSE_BASE = "https://ngdc.cncb.ac.cn/gsa/browse"
+CNCB_BIOPROJECT_BROWSE_BASE = "https://ngdc.cncb.ac.cn/bioproject/browse"
+GWH_API_BASE = "https://ngdc.cncb.ac.cn/gwh/api/public"
 TOOL_NAME = "ena_metadata_harmonization"
 
-# I did not find a clear public ENA RPS cap in the current docs, so use a
-# conservative default for repeated XML fetches.
 DEFAULT_REQUESTS_PER_SECOND = 2.0
 MIN_REQUEST_INTERVAL_SECONDS = 1.0 / DEFAULT_REQUESTS_PER_SECOND
-PROJECT_RE = re.compile(r"^[A-Z]{4,}\d+$", re.IGNORECASE)
+# CRA prefix is only 3 chars, so allow 2+ letter prefixes
+PROJECT_RE = re.compile(r"^[A-Z]{2,}\d+$", re.IGNORECASE)
 XML_BATCH_SIZE = 200
+SAMC_RE = re.compile(r"\bSAMC\d+\b")
+PRJCA_RE = re.compile(r"\bPRJCA\d+\b")
+
+DB_PREFIXES: dict[str, str] = {
+    "SAMEA": "ena",  "PRJEB": "ena", "ERP": "ena", "ERS": "ena",
+    "PRJCA": "cncb", "SAMC": "cncb", "CRA": "cncb",
+}
 
 CORE_COLUMNS = [
     "project_accession",
@@ -49,6 +70,15 @@ CORE_COLUMNS = [
 ]
 
 
+
+def detect_database(project_accession: str) -> str:
+    acc = project_accession.upper()
+    for prefix in sorted(DB_PREFIXES, key=len, reverse=True):
+        if acc.startswith(prefix):
+            return DB_PREFIXES[prefix]
+    return "ena"
+
+
 class ENAClient:
     def __init__(self, tool: str = TOOL_NAME) -> None:
         self.tool = tool
@@ -59,13 +89,21 @@ class ENAClient:
         if elapsed < MIN_REQUEST_INTERVAL_SECONDS:
             time.sleep(MIN_REQUEST_INTERVAL_SECONDS - elapsed)
 
-    def _get(self, url: str, params: dict[str, str] | None = None) -> requests.Response:
+    def _get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> requests.Response:
         self._throttle()
+        merged_headers = {"User-Agent": self.tool}
+        if headers:
+            merged_headers.update(headers)
         try:
             response = requests.get(
                 url,
                 params=params,
-                headers={"User-Agent": self.tool},
+                headers=merged_headers,
                 timeout=30,
             )
             response.raise_for_status()
@@ -77,6 +115,8 @@ class ENAClient:
 
         self._last_request_time = time.monotonic()
         return response
+
+    # ── ENA ──────────────────────────────────────────────────────────────────
 
     def fetch_sample_accessions(self, project_accession: str) -> list[str]:
         response = self._get(
@@ -90,16 +130,42 @@ class ENAClient:
             },
         )
         records = response.json()
-        sample_accessions = []
-        for record in records:
-            accession = str(record.get("sample_accession", "")).strip()
-            if accession:
-                sample_accessions.append(accession)
-        return sample_accessions
+        return [str(r.get("sample_accession", "")).strip() for r in records if r.get("sample_accession")]
 
     def fetch_samples_xml_batch(self, sample_accessions: list[str]) -> str:
         response = self._get(f"{ENA_BROWSER_XML_BASE}/{','.join(sample_accessions)}")
         return response.text
+
+    # ── CNCB-GSA ─────────────────────────────────────────────────────────────
+
+    def fetch_cncb_prjca_from_cra(self, cra_accession: str) -> str:
+        """Resolve a CRA accession to its PRJCA via the GSA browse page."""
+        response = self._get(
+            f"{CNCB_GSA_BROWSE_BASE}/{cra_accession}",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        matches = PRJCA_RE.findall(response.text)
+        if not matches:
+            raise RuntimeError(
+                f"Could not find a PRJCA accession on the browse page for {cra_accession}."
+            )
+        return matches[0]
+
+    def fetch_cncb_samc_accessions(self, prjca_accession: str) -> list[str]:
+        """Scrape the CNCB BioProject browse page to get all linked SAMC accessions."""
+        response = self._get(
+            f"{CNCB_BIOPROJECT_BROWSE_BASE}/{prjca_accession}",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        return list(dict.fromkeys(SAMC_RE.findall(response.text)))
+
+    def fetch_gwh_biosample(self, samc_accession: str) -> dict:
+        """Fetch BioSample attributes from the CNCB GWH API."""
+        response = self._get(f"{GWH_API_BASE}/bioSample/{samc_accession}")
+        return response.json()
+
+
+# ── Column helpers ────────────────────────────────────────────────────────────
 
 
 def normalize_column_name(raw_name: str) -> str:
@@ -154,6 +220,9 @@ def assign_dynamic_column(
     add_value(row, tag_to_column[raw_tag], value)
 
 
+# ── ENA parsing ──────────────────────────────────────────────────────────────
+
+
 def parse_sample_element(
     project_accession: str,
     sample: ET.Element,
@@ -181,14 +250,66 @@ def parse_sample_element(
     return row
 
 
+# ── CNCB-GSA / GWH parsing ───────────────────────────────────────────────────
+
+# Fields inside sampleAttribute that are internal bookkeeping, not biology
+_GWH_SKIP_ATTR_KEYS = {"sample", "attributeId", "taxon"}
+
+
+def parse_gwh_biosample(
+    project_accession: str,
+    data: dict,
+    samc_accession: str,
+    tag_to_column: OrderedDict[str, str],
+    column_to_tag: dict[str, str],
+) -> dict[str, str]:
+    taxon = data.get("taxon") or {}
+    sample_attr = data.get("sampleAttribute") or {}
+    attr_taxon = sample_attr.get("taxon") or {}
+
+    taxon_id = str(taxon.get("taxonId", "") or attr_taxon.get("taxonId", "") or "")
+    sci_name = taxon.get("name", "") or attr_taxon.get("name", "") or ""
+
+    row: dict[str, str] = {
+        "project_accession": project_accession,
+        "sample_accession": data.get("accession", samc_accession),
+        "sample_alias": data.get("name", ""),
+        "sample_title": data.get("title", "") or data.get("name", ""),
+        "center_name": "",
+        "primary_id": data.get("accession", samc_accession),
+        "secondary_id": "",
+        "taxon_id": taxon_id,
+        "scientific_name": sci_name,
+        "description": data.get("description", "") or "",
+        "error": "",
+    }
+
+    # Flatten all sampleAttribute fields as dynamic columns
+    for key, val in sample_attr.items():
+        if key in _GWH_SKIP_ATTR_KEYS or val is None or val == "":
+            continue
+        # sex is stored as int (1=male, 2=female) in some sample types
+        if key == "sex":
+            val = {1: "male", 2: "female"}.get(val, str(val))
+        assign_dynamic_column(key, str(val), row, tag_to_column, column_to_tag)
+
+    return row
+
+
+# ── Per-database fetch orchestration ─────────────────────────────────────────
+
+
 def chunked(values: list[str], size: int) -> list[list[str]]:
     return [values[i:i + size] for i in range(0, len(values), size)]
 
 
-def fetch_rows(project_accession: str, max_samples: int | None = None) -> tuple[list[dict[str, str]], list[str]]:
-    import sys
-    client = ENAClient()
-    print(f"Fetching samples for {project_accession}...", file=sys.stderr, flush=True)
+def _fetch_ena_rows(
+    client: ENAClient,
+    project_accession: str,
+    max_samples: int | None,
+    tag_to_column: OrderedDict[str, str],
+    column_to_tag: dict[str, str],
+) -> list[dict[str, str]]:
     sample_accessions = unique_preserving_order(client.fetch_sample_accessions(project_accession))
     if not sample_accessions:
         raise RuntimeError(f"No sample accessions found for project {project_accession}")
@@ -200,10 +321,6 @@ def fetch_rows(project_accession: str, max_samples: int | None = None) -> tuple[
     print(f"  Found {total} sample(s), fetching in {len(batches)} batch(es).", file=sys.stderr, flush=True)
 
     rows: list[dict[str, str]] = []
-    tag_to_column: OrderedDict[str, str] = OrderedDict()
-    column_to_tag: dict[str, str] = {}
-    fetched = 0
-
     for batch_i, batch in enumerate(batches, 1):
         start = (batch_i - 1) * XML_BATCH_SIZE + 1
         end = start + len(batch) - 1
@@ -226,11 +343,72 @@ def fetch_rows(project_accession: str, max_samples: int | None = None) -> tuple[
                 rows.append({"project_accession": project_accession, "sample_accession": acc, "error": "not returned in batch XML"})
             else:
                 rows.append(parse_sample_element(project_accession, sample_el, acc, tag_to_column, column_to_tag))
-        fetched += len(sample_elements)
 
     errors = sum(1 for r in rows if r.get("error"))
     suffix = f", {errors} error(s)" if errors else ""
     print(f"Done: {total - errors}/{total} samples fetched{suffix}", file=sys.stderr, flush=True)
+    return rows
+
+
+def _fetch_cncb_rows(
+    client: ENAClient,
+    project_accession: str,
+    max_samples: int | None,
+    tag_to_column: OrderedDict[str, str],
+    column_to_tag: dict[str, str],
+) -> list[dict[str, str]]:
+    # Resolve CRA → PRJCA so we can get the full sample list from BioProject page
+    if project_accession.upper().startswith("CRA"):
+        print(f"  Resolving {project_accession} to PRJCA...", file=sys.stderr, flush=True)
+        prjca = client.fetch_cncb_prjca_from_cra(project_accession)
+        print(f"  Found: {prjca}", file=sys.stderr, flush=True)
+    else:
+        prjca = project_accession
+
+    print(f"  Scraping SAMC accessions from BioProject page ({prjca})...", file=sys.stderr, flush=True)
+    samc_list = client.fetch_cncb_samc_accessions(prjca)
+    if not samc_list:
+        raise RuntimeError(f"No SAMC accessions found on BioProject page for {prjca}")
+    if max_samples is not None:
+        samc_list = samc_list[:max_samples]
+
+    total = len(samc_list)
+    print(f"  Found {total} sample(s), fetching via GWH API...", file=sys.stderr, flush=True)
+
+    rows: list[dict[str, str]] = []
+    for i, samc in enumerate(samc_list, 1):
+        print(f"  [{i}/{total}] {samc}...", file=sys.stderr, end="", flush=True)
+        try:
+            data = client.fetch_gwh_biosample(samc)
+            if data.get("message") != "SUCCESS":
+                raise RuntimeError(f"GWH API returned: {data.get('message')}")
+            rows.append(parse_gwh_biosample(project_accession, data, samc, tag_to_column, column_to_tag))
+            print(" ok", file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f" error: {exc}", file=sys.stderr, flush=True)
+            rows.append({"project_accession": project_accession, "sample_accession": samc, "error": str(exc)})
+
+    errors = sum(1 for r in rows if r.get("error"))
+    suffix = f", {errors} error(s)" if errors else ""
+    print(f"Done: {total - errors}/{total} samples fetched{suffix}", file=sys.stderr, flush=True)
+    return rows
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+
+def fetch_rows(project_accession: str, max_samples: int | None = None) -> tuple[list[dict[str, str]], list[str]]:
+    client = ENAClient()
+    database = detect_database(project_accession)
+    print(f"Fetching samples for {project_accession} (source: {database.upper()})...", file=sys.stderr, flush=True)
+
+    tag_to_column: OrderedDict[str, str] = OrderedDict()
+    column_to_tag: dict[str, str] = {}
+
+    if database == "cncb":
+        rows = _fetch_cncb_rows(client, project_accession, max_samples, tag_to_column, column_to_tag)
+    else:
+        rows = _fetch_ena_rows(client, project_accession, max_samples, tag_to_column, column_to_tag)
 
     columns = CORE_COLUMNS + [column for column in tag_to_column.values() if column not in CORE_COLUMNS]
     return rows, columns
@@ -253,11 +431,14 @@ def write_csv(rows: list[dict[str, str]], columns: list[str], output_path: str |
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fetch ENA sample metadata for a project/study accession and flatten it into CSV.",
+        description=(
+            "Fetch sample metadata for a project/study accession and flatten to CSV. "
+            "Database is auto-detected: ENA (PRJEB/ERP) or CNCB-GSA (PRJCA/CRA)."
+        ),
     )
     parser.add_argument(
         "project_accession",
-        help="ENA project/study accession, for example PRJEB46665.",
+        help="Project/study accession, e.g. PRJEB46665, CRA000112, PRJCA000246.",
     )
     parser.add_argument(
         "-o",
@@ -267,7 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-samples",
         type=int,
-        help="Only fetch the first N sample accessions from the project. Useful for quick tests on large studies.",
+        help="Only fetch the first N samples. Useful for quick tests on large studies.",
     )
     return parser
 
