@@ -19,15 +19,19 @@ Single accession, print CSV to stdout:
 Single accession, write to file:
     python scripts/get_ena_project_samples.py PRJCA000246 -o samples.csv
 
-Batch from CSV (accession column auto-detected; all studies concatenated):
+Batch from CSV — one CSV per accession in an output directory (recommended):
+    python scripts/get_ena_project_samples.py --input-csv papers.csv --output-dir metadata/samples/
+    python scripts/get_ena_project_samples.py --input-csv papers.csv --id-column study_acc --output-dir metadata/samples/
+
+Batch from CSV — concatenate all studies into one file (legacy; produces very wide CSV):
     python scripts/get_ena_project_samples.py --input-csv papers.csv -o all_samples.csv
-    python scripts/get_ena_project_samples.py --input-csv papers.csv --id-column study_acc -o all_samples.csv
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import sys
 import threading
@@ -576,6 +580,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write CSV to this path. If omitted, CSV is printed to stdout.",
     )
     parser.add_argument(
+        "--output-dir",
+        help=(
+            "Write one CSV per accession into this directory (batch mode). "
+            "Each file is named {ACCESSION}.csv. Recommended over -o for --input-csv batches "
+            "to avoid schema union across studies. Cannot be combined with -o when using --input-csv."
+        ),
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         help="Only fetch the first N samples per accession. Useful for quick tests.",
@@ -590,6 +602,9 @@ def main() -> int:
     if args.max_samples is not None and args.max_samples <= 0:
         print("Error: --max-samples must be a positive integer", file=sys.stderr)
         return 1
+
+    if args.input_csv and args.output_dir and args.output:
+        parser.error("--output-dir and -o cannot be combined with --input-csv.")
 
     # Resolve accession list
     if args.input_csv:
@@ -615,7 +630,27 @@ def main() -> int:
             print(f"Error: invalid project accession: {raw!r}", file=sys.stderr)
             return 1
 
-    # Fetch and concatenate
+    # Per-accession output directory mode (recommended for batches)
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        fetched = 0
+        for raw in accessions:
+            acc = raw.strip().upper()
+            out_path = os.path.join(args.output_dir, f"{acc}.csv")
+            try:
+                rows, columns = fetch_rows(acc, max_samples=args.max_samples)
+            except Exception as exc:
+                print(f"Error fetching {acc}: {exc}", file=sys.stderr)
+                continue
+            write_csv(rows, columns, out_path)
+            fetched += 1
+        if fetched == 0:
+            print("Error: no accessions fetched successfully.", file=sys.stderr)
+            return 1
+        print(f"Done: {fetched}/{len(accessions)} accessions written to {args.output_dir}/", file=sys.stderr)
+        return 0
+
+    # Concatenate-into-one-file mode (legacy; produces wide schema union across studies)
     all_rows: list[dict[str, str]] = []
     all_columns: list[str] = list(CORE_COLUMNS)
 

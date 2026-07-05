@@ -41,7 +41,8 @@ Retrieves MeSH disease annotations from PubTator3. Single ID prints one disease 
 **Usage:**
 ```
 get_ena_project_samples.py <ACCESSION> [-o output.csv] [--max-samples N]
-get_ena_project_samples.py --input-csv FILE [--id-column COLUMN] [-o output.csv]
+get_ena_project_samples.py --input-csv FILE [--id-column COLUMN] --output-dir DIR/
+get_ena_project_samples.py --input-csv FILE [--id-column COLUMN] [-o all.csv]  # legacy concat
 ```
 
 Fetches flattened sample-level metadata and writes CSV. Database is auto-detected from the accession prefix:
@@ -52,7 +53,7 @@ Fetches flattened sample-level metadata and writes CSV. Database is auto-detecte
 | PRJNA, SRP, DRP | ENA | Primary query + `read_run` fallback (~28% need fallback) |
 | PRJCA, CRA | CNCB-GSA | HTML scrape → GWH API per sample, parallelized |
 
-`--input-csv` reads accessions from a CSV (column auto-detected or set with `--id-column`) and concatenates all studies into one output. Outputs `project_accession`, `sample_accession`, `sample_alias`, `sample_title`, plus any study-specific attribute columns. Use `--max-samples N` for quick inspections on large studies. Per-sample progress is printed to stderr. Run with `-h` for full options.
+For batch runs, prefer `--output-dir` over `-o`: it writes one `{ACCESSION}.csv` per study so each file only has that study's columns — no 8000-column schema union. `-o` (concatenated) still works but produces very wide files when studies use different attribute names. Use `--max-samples N` for quick inspections. Per-sample progress is printed to stderr. Run with `-h` for full options.
 
 ### get_ena_accession.py — Extract ENA accessions from papers
 
@@ -124,120 +125,146 @@ Then probe with shell/Python tools (see CSV Inspection Workflow below).
 head -3 input.csv
 ```
 
-Find the column whose values match `^(PRJEB|PRJCA|CRA|ERP)\d+`. Name the output directory after the input file:
+Find the column whose values match `^(PRJEB|PRJCA|CRA|ERP|PRJNA|SRP)\d+`. Name the output directory after the input file:
 
 ```bash
-mkdir -p input_stem_metadata   # replace input_stem with the CSV filename without extension
+mkdir -p input_stem_metadata/samples   # replace input_stem with the CSV filename without extension
 ```
 
-**Step 2 — Fetch metadata for all accessions in one call**
+**Step 2 — Fetch metadata (one CSV per accession)**
 
-Pass the CSV directly — the script auto-detects the accession column and concatenates all studies into one output file. Redirect stderr to a log file so progress doesn't flood context:
+Use `--output-dir` — each study gets its own file, so column detection in Steps 3–4 works per-study with no schema collision:
 
 ```bash
 uv run --with requests python3 ${CLAUDE_PLUGIN_ROOT}/scripts/get_ena_project_samples.py \
   --input-csv input.csv \
-  -o input_stem_metadata/all_samples.csv \
+  --output-dir input_stem_metadata/samples/ \
   2>input_stem_metadata/fetch.log
 ```
 
-If the accession column has an ambiguous name, specify it explicitly:
-
-```bash
-uv run --with requests python3 ${CLAUDE_PLUGIN_ROOT}/scripts/get_ena_project_samples.py \
-  --input-csv input.csv --id-column study_accession \
-  -o input_stem_metadata/all_samples.csv \
-  2>input_stem_metadata/fetch.log
-```
-
-Check progress without loading the log into context:
+If the accession column has an ambiguous name, specify it explicitly with `--id-column study_accession`. Check progress:
 
 ```bash
 tail -5 input_stem_metadata/fetch.log
 ```
 
-**Step 3 — Stage 1 phenotype extraction (regex on column names)**
+**Step 3 — Per-study phenotype extraction with false-positive guard**
 
-All studies are now in one file. Run this Python one-liner against the header only — no grep `\b` issues, zero context overhead:
+Iterate over every study file. For each one, detect age/sex/disease columns by name, then **validate the disease column's actual values** before committing — this filters out numeric scores, binary y/n flags, and ontology codes that match on name but carry no useful label.
 
 ```bash
-python3 -c "
-import csv, re
+python3 << 'EOF'
+import csv, re, os
+from pathlib import Path
+
 AGE_RE = re.compile(r'^age$|^age_|_age$|host_age', re.I)
 SEX_RE = re.compile(r'^sex$|^gender$|biological_sex|host_sex', re.I)
-DIS_RE = re.compile(r'disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity', re.I)
-with open('input_stem_metadata/all_samples.csv') as f:
-    cols = next(csv.reader(f))
-print('AGE:', [c for c in cols if AGE_RE.search(c)])
-print('SEX:', [c for c in cols if SEX_RE.search(c)])
-print('DIS:', [c for c in cols if DIS_RE.search(c)])
-"
+DIS_RE = re.compile(r'disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity|syndrome', re.I)
+SEX_MAP = {'m':'male','male':'male','boy':'male','1':'male',
+           'f':'female','female':'female','girl':'female','2':'female'}
+BAD_VAL_RE = re.compile(r'^(y|n|yes|no|true|false|0|1|na|n/a|not[ _]applicable|missing|unknown)$', re.I)
+ONTOLOGY_RE = re.compile(r'^(DOID|HP|OMIM|MeSH|EFO):\d+', re.I)
+
+def disease_col_is_useful(values):
+    non_empty = [v.strip() for v in values if v.strip()]
+    if not non_empty:
+        return False
+    if sum(1 for v in non_empty if re.fullmatch(r'[-+]?\d+(\.\d+)?', v)) / len(non_empty) > 0.8:
+        return False  # mostly numeric scores
+    if all(ONTOLOGY_RE.match(v) for v in non_empty):
+        return False  # ontology codes — not human-readable labels
+    if all(BAD_VAL_RE.fullmatch(v) for v in non_empty):
+        return False  # binary flags
+    return True
+
+samples_dir = Path('input_stem_metadata/samples')
+out_rows, study_summary = [], []
+
+for csv_path in sorted(samples_dir.glob('*.csv')):
+    acc = csv_path.stem
+    with open(csv_path) as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        continue
+    cols = list(rows[0].keys())
+
+    age_col = next((c for c in cols if AGE_RE.search(c)), None)
+    sex_col = next((c for c in cols if SEX_RE.search(c)), None)
+    dis_col = next(
+        (c for c in cols if DIS_RE.search(c)
+         and disease_col_is_useful([r.get(c, '') for r in rows])),
+        None
+    )
+
+    for r in rows:
+        sex_raw = (r.get(sex_col, '') if sex_col else '').lower().strip()
+        out_rows.append({
+            'study_accession': acc,
+            'sample_accession': r.get('sample_accession', ''),
+            'age':    r.get(age_col, '') if age_col else '',
+            'sex':    SEX_MAP.get(sex_raw, ''),
+            'disease': r.get(dis_col, '') if dis_col else '',
+            'disease_col_name': dis_col or '',
+        })
+
+    n_dis = sum(1 for r in rows if r.get(dis_col, '').strip()) if dis_col else 0
+    study_summary.append({'study_accession': acc, 'n_samples': len(rows),
+        'age_col': age_col or '', 'sex_col': sex_col or '',
+        'dis_col': dis_col or '', 'n_with_disease': n_dis})
+
+with open('input_stem_metadata/phenotype_samples.csv', 'w', newline='') as f:
+    w = csv.DictWriter(f, fieldnames=['study_accession','sample_accession','age','sex','disease','disease_col_name'])
+    w.writeheader(); w.writerows(out_rows)
+
+with open('input_stem_metadata/study_summary.csv', 'w', newline='') as f:
+    w = csv.DictWriter(f, fieldnames=['study_accession','n_samples','age_col','sex_col','dis_col','n_with_disease'])
+    w.writeheader(); w.writerows(study_summary)
+
+print(f"Done: {len(study_summary)} studies, {len(out_rows)} samples")
+print(f"With age:     {sum(1 for r in out_rows if r['age'])}")
+print(f"With sex:     {sum(1 for r in out_rows if r['sex'])}")
+print(f"With disease: {sum(1 for r in out_rows if r['disease'])}")
+EOF
 ```
 
-Note the column names. If all three have matches, skip Stage 2 and go directly to Step 5.
+**Step 4 — LLM curation of detected disease columns (false-positive review)**
 
-**Step 4 — Stage 2 disease review (controlled file read for false negatives)**
-
-Only reach for this when Stage 1 found **no** disease column. Do not read the full CSV.
-
-4a. Read **only the header row** and list all column names with indices:
-
-```bash
-head -1 input_stem_metadata/all_samples.csv | tr ',' '\n' | nl
-```
-
-Scan the list for columns that could encode disease or group membership: names containing `host_phenotype`, `subject_group`, `clinical_status`, `study_condition`, `body_site`, disease abbreviations (`crc`, `ibd`, `cd`, `uc`, `t2d`), or columns ending in `_type`, `_group`, `_status`. This is LLM judgment — look for anything that a biologist might use to distinguish cases from controls.
-
-4b. For each suspicious column, peek at its first few distinct values — do not read whole rows:
+The value guard in Step 3 catches obvious junk, but some columns need a judgment call (e.g. `host_status`, abbreviations like `HC/SZ`). Run this to print each study's detected disease column and its distinct values, then read through and flag any that don't represent real disease groups:
 
 ```bash
 python3 -c "
 import csv
-with open('input_stem_metadata/all_samples.csv') as f:
-    rows = list(csv.DictReader(f))
-col = 'SUSPICIOUS_COLUMN_NAME'
-print(list(dict.fromkeys(r[col] for r in rows if r.get(col)))[:5])
+from pathlib import Path
+summaries = list(csv.DictReader(open('input_stem_metadata/study_summary.csv')))
+for s in summaries:
+    if not s['dis_col']:
+        continue
+    rows = list(csv.DictReader(open(Path('input_stem_metadata/samples') / f\"{s['study_accession']}.csv\")))
+    vals = list(dict.fromkeys(r.get(s['dis_col'],'').strip() for r in rows if r.get(s['dis_col'],'').strip()))[:8]
+    print(f\"{s['study_accession']} | col={s['dis_col']!r} | n={s['n_with_disease']} | {vals}\")
 "
 ```
 
-If those values confirm disease signal (e.g. `['CRC', 'Healthy', 'CRC', 'Healthy', 'IBD']`), note the column name — you will use it in Step 5. If nothing surfaces after this pass, leave `disease` blank — do not guess.
+Review each line. For any study where the values are not real disease labels (e.g. processing batches, sample codes, numeric IDs), note the accession and clear its `dis_col` before finalising — re-run Step 3's final write block with those accessions' `dis_col` manually set to `''`.
 
-**Step 5 — Produce the combined phenotype table**
+If a study has a disease column that Stage 1 **missed** (e.g. `host_phenotype`, `subject_group`, abbreviations like `crc_status`), add it to the relevant study's CSV by hand or override `dis_col` in Step 3.
 
-Run this command to write `phenotype_coverage.csv`. It auto-detects columns using the same patterns as Stage 1. If Stage 2 found a disease column that Stage 1 missed, replace the `dis_col = next(...)` line with `dis_col = 'your_column_name'` before running:
+**Step 5 — Summarise coverage**
 
 ```bash
 python3 -c "
-import csv, re
-AGE_RE = re.compile(r'^age$|^age_|_age$|host_age', re.I)
-SEX_RE = re.compile(r'^sex$|^gender$|biological_sex|host_sex', re.I)
-DIS_RE = re.compile(r'disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity', re.I)
-SEX_MAP = {'m':'male','male':'male','boy':'male','1':'male',
-           'f':'female','female':'female','girl':'female','2':'female'}
-with open('input_stem_metadata/all_samples.csv') as fh:
-    rows = list(csv.DictReader(fh))
-cols = list(rows[0].keys()) if rows else []
-age_col = next((c for c in cols if AGE_RE.search(c)), None)
-sex_col = next((c for c in cols if SEX_RE.search(c)), None)
-dis_col = next((c for c in cols if DIS_RE.search(c)), None)
-# If Stage 2 found a disease column not matched above, uncomment and set:
-# dis_col = 'your_column_name'
-with open('input_stem_metadata/phenotype_coverage.csv', 'w', newline='') as fh:
-    w = csv.DictWriter(fh, fieldnames=['study_accession','sample_accession','age','sex','disease','disease_col_name'])
-    w.writeheader()
-    for r in rows:
-        sex_raw = (r.get(sex_col,'') if sex_col else '').lower().strip()
-        w.writerow({'study_accession':r.get('project_accession',''),
-            'sample_accession':r.get('sample_accession',''),
-            'age':r.get(age_col,'') if age_col else '',
-            'sex':SEX_MAP.get(sex_raw,''),
-            'disease':r.get(dis_col,'') if dis_col else '',
-            'disease_col_name':dis_col or ''})
-print(f'Done: {len(rows)} rows  age={age_col!r}  sex={sex_col!r}  disease={dis_col!r}')
+import csv
+rows = list(csv.DictReader(open('input_stem_metadata/study_summary.csv')))
+total = len(rows)
+print(f'Studies: {total}')
+print(f'With age:     {sum(1 for r in rows if r[\"age_col\"])} ({sum(1 for r in rows if r[\"age_col\"])*100//total}%)')
+print(f'With sex:     {sum(1 for r in rows if r[\"sex_col\"])} ({sum(1 for r in rows if r[\"sex_col\"])*100//total}%)')
+print(f'With disease: {sum(1 for r in rows if r[\"dis_col\"])} ({sum(1 for r in rows if r[\"dis_col\"])*100//total}%)')
+print(f'Empty:        {sum(1 for r in rows if not r[\"age_col\"] and not r[\"sex_col\"] and not r[\"dis_col\"])} ({sum(1 for r in rows if not r[\"age_col\"] and not r[\"sex_col\"] and not r[\"dis_col\"])*100//total}%)')
 "
 ```
 
-After it prints, report a one-line summary per study: how many samples, which columns were used, and how many samples have a blank disease field.
+Report findings to the user. Note any studies where disease was detected but values looked borderline (from Step 4).
 
 ---
 
