@@ -150,118 +150,63 @@ tail -5 input_stem_metadata/fetch.log
 
 **Step 3 — Per-study phenotype extraction with false-positive guard**
 
-Iterate over every study file. For each one, detect age/sex/disease columns by name, then **validate the disease column's actual values** before committing — this filters out numeric scores, binary y/n flags, and ontology codes that match on name but carry no useful label.
+For each study CSV in `samples/`, detect age/sex/disease columns by name, validate values, and write `input_stem_metadata/phenotype_samples.csv` (one row per sample: `study_accession`, `sample_accession`, `age`, `sex`, `disease`, `disease_col_name`) and `input_stem_metadata/study_summary.csv` (one row per study: `study_accession`, `n_samples`, `age_col`, `sex_col`, `dis_col`, `n_with_disease`). Write a script to do this — don't try to inline it.
+
+**Column detection — Python `re`, case-insensitive:**
+
+| Field | Pattern | Gotchas |
+|-------|---------|---------|
+| Age | `^age$\|^age_\|_age$\|host_age` | Must anchor — bare `age` substring matches `stage`, `dosage`, `passage`, etc. |
+| Sex | `^sex$\|^gender$\|biological_sex\|host_sex` | — |
+| Disease | `disease\|diagnosis\|condition\|phenotype\|health_state\|disease_state\|disease_status\|case_control\|icd\|pathology\|morbidity\|syndrome` | This list is a starting point. Real studies use many more column names — flag anything the regex misses when reviewing Step 4 output. |
+
+**Normalize sex:** `M`/`male`/`boy`/`1` → `male`; `F`/`female`/`girl`/`2` → `female`; anything else → blank.
+
+**False-positive guard for disease:** After matching a column by name, validate its non-empty values before committing — reject if:
+- >80% are pure numeric (Charlson index, severity scores, etc.)
+- All match an ontology code pattern (`DOID:`, `HP:`, `OMIM:`, `EFO:`, etc.)
+- All are binary flags (`y`/`n`, `yes`/`no`, `true`/`false`, `0`/`1`, `na`, `missing`, `unknown`)
+
+**Step 4 — LLM curation of detected disease columns (false-positive and false-negative review)**
+
+The value guard in Step 3 catches obvious junk, but some columns need judgment. Run this to print each detected disease column and its distinct values:
 
 ```bash
-python3 << 'EOF'
-import csv, re, os
-from pathlib import Path
-
-AGE_RE = re.compile(r'^age$|^age_|_age$|host_age', re.I)
-SEX_RE = re.compile(r'^sex$|^gender$|biological_sex|host_sex', re.I)
-DIS_RE = re.compile(r'disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity|syndrome', re.I)
-SEX_MAP = {'m':'male','male':'male','boy':'male','1':'male',
-           'f':'female','female':'female','girl':'female','2':'female'}
-BAD_VAL_RE = re.compile(r'^(y|n|yes|no|true|false|0|1|na|n/a|not[ _]applicable|missing|unknown)$', re.I)
-ONTOLOGY_RE = re.compile(r'^(DOID|HP|OMIM|MeSH|EFO):\d+', re.I)
-
-def disease_col_is_useful(values):
-    non_empty = [v.strip() for v in values if v.strip()]
-    if not non_empty:
-        return False
-    if sum(1 for v in non_empty if re.fullmatch(r'[-+]?\d+(\.\d+)?', v)) / len(non_empty) > 0.8:
-        return False  # mostly numeric scores
-    if all(ONTOLOGY_RE.match(v) for v in non_empty):
-        return False  # ontology codes — not human-readable labels
-    if all(BAD_VAL_RE.fullmatch(v) for v in non_empty):
-        return False  # binary flags
-    return True
-
-samples_dir = Path('input_stem_metadata/samples')
-out_rows, study_summary = [], []
-
-for csv_path in sorted(samples_dir.glob('*.csv')):
-    acc = csv_path.stem
-    with open(csv_path) as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
-        continue
-    cols = list(rows[0].keys())
-
-    age_col = next((c for c in cols if AGE_RE.search(c)), None)
-    sex_col = next((c for c in cols if SEX_RE.search(c)), None)
-    dis_col = next(
-        (c for c in cols if DIS_RE.search(c)
-         and disease_col_is_useful([r.get(c, '') for r in rows])),
-        None
-    )
-
-    for r in rows:
-        sex_raw = (r.get(sex_col, '') if sex_col else '').lower().strip()
-        out_rows.append({
-            'study_accession': acc,
-            'sample_accession': r.get('sample_accession', ''),
-            'age':    r.get(age_col, '') if age_col else '',
-            'sex':    SEX_MAP.get(sex_raw, ''),
-            'disease': r.get(dis_col, '') if dis_col else '',
-            'disease_col_name': dis_col or '',
-        })
-
-    n_dis = sum(1 for r in rows if r.get(dis_col, '').strip()) if dis_col else 0
-    study_summary.append({'study_accession': acc, 'n_samples': len(rows),
-        'age_col': age_col or '', 'sex_col': sex_col or '',
-        'dis_col': dis_col or '', 'n_with_disease': n_dis})
-
-with open('input_stem_metadata/phenotype_samples.csv', 'w', newline='') as f:
-    w = csv.DictWriter(f, fieldnames=['study_accession','sample_accession','age','sex','disease','disease_col_name'])
-    w.writeheader(); w.writerows(out_rows)
-
-with open('input_stem_metadata/study_summary.csv', 'w', newline='') as f:
-    w = csv.DictWriter(f, fieldnames=['study_accession','n_samples','age_col','sex_col','dis_col','n_with_disease'])
-    w.writeheader(); w.writerows(study_summary)
-
-print(f"Done: {len(study_summary)} studies, {len(out_rows)} samples")
-print(f"With age:     {sum(1 for r in out_rows if r['age'])}")
-print(f"With sex:     {sum(1 for r in out_rows if r['sex'])}")
-print(f"With disease: {sum(1 for r in out_rows if r['disease'])}")
-EOF
-```
-
-**Step 4 — LLM curation of detected disease columns (false-positive review)**
-
-The value guard in Step 3 catches obvious junk, but some columns need a judgment call (e.g. `host_status`, abbreviations like `HC/SZ`). Run this to print each study's detected disease column and its distinct values, then read through and flag any that don't represent real disease groups:
-
-```bash
-python3 -c "
+python3 - << 'EOF'
 import csv
 from pathlib import Path
+
 summaries = list(csv.DictReader(open('input_stem_metadata/study_summary.csv')))
 for s in summaries:
     if not s['dis_col']:
         continue
-    rows = list(csv.DictReader(open(Path('input_stem_metadata/samples') / f\"{s['study_accession']}.csv\")))
-    vals = list(dict.fromkeys(r.get(s['dis_col'],'').strip() for r in rows if r.get(s['dis_col'],'').strip()))[:8]
-    print(f\"{s['study_accession']} | col={s['dis_col']!r} | n={s['n_with_disease']} | {vals}\")
-"
+    rows = list(csv.DictReader(open(Path('input_stem_metadata/samples') / f"{s['study_accession']}.csv")))
+    vals = list(dict.fromkeys(
+        r.get(s['dis_col'], '').strip() for r in rows if r.get(s['dis_col'], '').strip()
+    ))[:8]
+    print(f"{s['study_accession']} | col={s['dis_col']!r} | n={s['n_with_disease']} | {vals}")
+EOF
 ```
 
-Review each line. For any study where the values are not real disease labels (e.g. processing batches, sample codes, numeric IDs), note the accession and clear its `dis_col` before finalising — re-run Step 3's final write block with those accessions' `dis_col` manually set to `''`.
+**Reading the output:**
 
-If a study has a disease column that Stage 1 **missed** (e.g. `host_phenotype`, `subject_group`, abbreviations like `crc_status`), add it to the relevant study's CSV by hand or override `dis_col` in Step 3.
+- **Obvious false positives** (processing batches, run IDs, numeric ranges): patch `study_summary.csv` — set `dis_col` to `''` and `n_with_disease` to `0` for that row, then re-filter `phenotype_samples.csv` to remove those rows.
+- **Obscure encoded values** (e.g. `H13`, `CRC24`, `HC_01`, `SZ`): do not dismiss these outright. Cross-reference the abstract — abbreviations like `H`→healthy, `CRC`→colorectal cancer, `HC`→healthy control are common and valuable. If the abstract confirms the encoding, the column is real; keep it and note the encoding in your report.
+- **False negatives** — if a study has no `dis_col` but you can see a disease-related column the regex missed (e.g. `host_phenotype`, `subject_group`, `crc_status`, domain abbreviations), add that accession + column name to a manual override and re-run extraction for that study with the correct column.
 
 **Step 5 — Summarise coverage**
 
 ```bash
-python3 -c "
+python3 - << 'EOF'
 import csv
 rows = list(csv.DictReader(open('input_stem_metadata/study_summary.csv')))
 total = len(rows)
 print(f'Studies: {total}')
-print(f'With age:     {sum(1 for r in rows if r[\"age_col\"])} ({sum(1 for r in rows if r[\"age_col\"])*100//total}%)')
-print(f'With sex:     {sum(1 for r in rows if r[\"sex_col\"])} ({sum(1 for r in rows if r[\"sex_col\"])*100//total}%)')
-print(f'With disease: {sum(1 for r in rows if r[\"dis_col\"])} ({sum(1 for r in rows if r[\"dis_col\"])*100//total}%)')
-print(f'Empty:        {sum(1 for r in rows if not r[\"age_col\"] and not r[\"sex_col\"] and not r[\"dis_col\"])} ({sum(1 for r in rows if not r[\"age_col\"] and not r[\"sex_col\"] and not r[\"dis_col\"])*100//total}%)')
-"
+print(f'With age:     {sum(1 for r in rows if r["age_col"])} ({sum(1 for r in rows if r["age_col"])*100//total}%)')
+print(f'With sex:     {sum(1 for r in rows if r["sex_col"])} ({sum(1 for r in rows if r["sex_col"])*100//total}%)')
+print(f'With disease: {sum(1 for r in rows if r["dis_col"])} ({sum(1 for r in rows if r["dis_col"])*100//total}%)')
+print(f'Empty:        {sum(1 for r in rows if not r["age_col"] and not r["sex_col"] and not r["dis_col"])} ({sum(1 for r in rows if not r["age_col"] and not r["sex_col"] and not r["dis_col"])*100//total}%)')
+EOF
 ```
 
 Report findings to the user. Note any studies where disease was detected but values looked borderline (from Step 4).
@@ -367,7 +312,7 @@ Extract `age`, `sex`, and `disease` when present. Use the two-stage approach —
 
 **Sex:** Pattern: `^sex$|^gender$|biological_sex|host_sex` (case-insensitive). Normalize values: `M`/`male`/`boy`/`1` → `male`; `F`/`female`/`girl`/`2` → `female`; anything else → blank.
 
-**Disease:** Stage 1 pattern: `disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity` (case-insensitive substring match — these terms don't appear as substrings in unrelated column names, so no word-boundary anchors needed). If no match, do Stage 2 (header scan + value peek on suspicious columns). Capture the specific disease term (e.g., `colorectal cancer`, `inflammatory bowel disease`). Leave blank if nothing surfaces after both stages.
+**Disease:** Stage 1 pattern: `disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity|syndrome` (case-insensitive substring match — these terms don't appear as substrings in unrelated column names, so no word-boundary anchors needed). If no match, do Stage 2 (header scan + value peek on suspicious columns). Capture the specific disease term (e.g., `colorectal cancer`, `inflammatory bowel disease`). Leave blank if nothing surfaces after both stages.
 
 Sex is almost always caught by Stage 1. Disease often needs Stage 2 — always do it before concluding disease is absent.
 
