@@ -150,7 +150,12 @@ tail -5 input_stem_metadata/fetch.log
 
 **Step 3 — Per-study phenotype extraction with false-positive guard**
 
-For each study CSV in `samples/`, detect age/sex/disease columns by name, validate values, and write `input_stem_metadata/phenotype_samples.csv` (one row per sample: `study_accession`, `sample_accession`, `age`, `sex`, `disease`, `disease_col_name`) and `input_stem_metadata/study_summary.csv` (one row per study: `study_accession`, `n_samples`, `age_col`, `sex_col`, `dis_col`, `n_with_disease`). Write a script to do this — don't try to inline it.
+For each study CSV in `samples/`, detect age/sex/disease columns by name, validate values, and write:
+
+- `input_stem_metadata/phenotype_samples.csv` — one row per sample: `study_accession`, `sample_accession`, `age`, `sex`, `disease`, `disease_col_name`, `dis_source`
+- `input_stem_metadata/study_summary.csv` — one row per study: `study_accession`, `n_samples`, `age_col`, `sex_col`, `dis_col`, `dis_source`, `n_with_disease`
+
+`dis_col` is always the name of the actual CSV column that was read (e.g. `host_disease`, `sample_alias`, `sample_title`). `dis_source` is `direct` when disease values are read straight from a named column, `alias` when they are decoded from a sample alias or title pattern. Write a script to do this — don't try to inline it.
 
 **Column detection — Python `re`, case-insensitive:**
 
@@ -166,6 +171,20 @@ For each study CSV in `samples/`, detect age/sex/disease columns by name, valida
 - >80% are pure numeric (Charlson index, severity scores, etc.)
 - All match an ontology code pattern (`DOID:`, `HP:`, `OMIM:`, `EFO:`, etc.)
 - All are binary flags (`y`/`n`, `yes`/`no`, `true`/`false`, `0`/`1`, `na`, `missing`, `unknown`)
+
+**Alias/title fallback:** If no disease column is found by name regex, inspect `sample_alias` and `sample_title` for group-encoding patterns — prefixes like `CON`/`Case`/`preC`, `NC`/`CC`, `H`/`CRC`, or suffixes like `_CA`/`_NA`. If a consistent pattern separates samples into groups, decode it and record `dis_col = 'sample_alias'` (or `'sample_title'`), `dis_source = 'alias'`. If no pattern is found, leave both blank.
+
+**Step 3.5 — Abstract resolution for generic alias labels**
+
+After running the extraction script, check `study_summary.csv` for any study where `dis_source = 'alias'` and the decoded disease values in `phenotype_samples.csv` are all generic — `case`, `patient`, `disease case`, `affected`, `cases` — without a specific disease name. Values like `colorectal cancer`, `CRSwNP`, `healthy control` are already resolved and can be skipped.
+
+For each study that triggers this: look up its PMID from the input CSV (column `pubmed_id` or similar), then fetch the abstract:
+
+```bash
+uv run --with requests python3 ${CLAUDE_PLUGIN_ROOT}/scripts/get_abstracts.py <PMID>
+```
+
+Read the abstract to identify the disease, then patch the generic labels in `phenotype_samples.csv` to the specific disease name (e.g. `disease case` → `colorectal cancer`). If no PMID is available, flag the study in Step 4 output and leave the generic label as-is.
 
 **Step 4 — LLM curation of detected disease columns (false-positive and false-negative review)**
 
@@ -184,14 +203,18 @@ for s in summaries:
     vals = list(dict.fromkeys(
         r.get(s['dis_col'], '').strip() for r in rows if r.get(s['dis_col'], '').strip()
     ))[:8]
-    print(f"{s['study_accession']} | col={s['dis_col']!r} | n={s['n_with_disease']} | {vals}")
+    print(f"{s['study_accession']} | col={s['dis_col']!r} | src={s['dis_source']} | n={s['n_with_disease']} | {vals}")
 EOF
 ```
 
 **Reading the output:**
 
-- **Obvious false positives** (processing batches, run IDs, numeric ranges): patch `study_summary.csv` — set `dis_col` to `''` and `n_with_disease` to `0` for that row, then re-filter `phenotype_samples.csv` to remove those rows.
-- **Obscure encoded values** (e.g. `H13`, `CRC24`, `HC_01`, `SZ`): do not dismiss these outright. Cross-reference the abstract — abbreviations like `H`→healthy, `CRC`→colorectal cancer, `HC`→healthy control are common and valuable. If the abstract confirms the encoding, the column is real; keep it and note the encoding in your report.
+The `src=` field tells you how to interpret what you're seeing:
+- `src=direct` — values shown are the actual disease labels from a named column. Review for false positives only.
+- `src=alias` — values shown are **raw alias/title strings** (e.g. `NC2`, `Case7`, `CA`), not decoded labels. The decoded disease labels are in `phenotype_samples.csv`. Cross-check that the decoding logic in the extraction script matches what the raw aliases imply. If the alias decoding produced generic labels (`disease case`, `patient`) and Step 3.5 wasn't able to resolve them, flag these here.
+
+- **Obvious false positives** (processing batches, run IDs, numeric ranges): patch `study_summary.csv` — set `dis_col` to `''`, `dis_source` to `''`, and `n_with_disease` to `0` for that row, then re-filter `phenotype_samples.csv` to remove those rows.
+- **Obscure encoded aliases** (e.g. raw values `H13`, `CRC24`, `HC_01`): if Step 3.5 didn't already resolve these, fetch the abstract with `get_abstracts.py` and decode manually. Do not dismiss — they usually map to real cohort labels.
 - **False negatives** — if a study has no `dis_col` but you can see a disease-related column the regex missed (e.g. `host_phenotype`, `subject_group`, `crc_status`, domain abbreviations), add that accession + column name to a manual override and re-run extraction for that study with the correct column.
 
 **Step 5 — Summarise coverage**
@@ -312,7 +335,7 @@ Extract `age`, `sex`, and `disease` when present. Use the two-stage approach —
 
 **Sex:** Pattern: `^sex$|^gender$|biological_sex|host_sex` (case-insensitive). Normalize values: `M`/`male`/`boy`/`1` → `male`; `F`/`female`/`girl`/`2` → `female`; anything else → blank.
 
-**Disease:** Stage 1 pattern: `disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity|syndrome` (case-insensitive substring match — these terms don't appear as substrings in unrelated column names, so no word-boundary anchors needed). If no match, do Stage 2 (header scan + value peek on suspicious columns). Capture the specific disease term (e.g., `colorectal cancer`, `inflammatory bowel disease`). Leave blank if nothing surfaces after both stages.
+**Disease:** Stage 1 pattern: `disease|diagnosis|condition|phenotype|health_state|disease_state|disease_status|case_control|icd|pathology|morbidity|syndrome` (case-insensitive substring match — these terms don't appear as substrings in unrelated column names, so no word-boundary anchors needed). If no match, do Stage 2 — inspect `sample_alias` and `sample_title` for group-encoding patterns (`CON`/`Case`, `NC`/`CC`, suffix `_CA`/`_NA`, etc.) and decode them. Record `dis_source = 'direct'` for Stage 1 hits, `dis_source = 'alias'` for Stage 2 decodes. Leave blank if nothing surfaces after both stages.
 
 Sex is almost always caught by Stage 1. Disease often needs Stage 2 — always do it before concluding disease is absent.
 
