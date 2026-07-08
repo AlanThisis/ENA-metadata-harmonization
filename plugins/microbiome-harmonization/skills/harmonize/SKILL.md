@@ -133,20 +133,22 @@ mkdir -p input_stem_metadata/samples   # replace input_stem with the CSV filenam
 
 **Step 2 — Fetch metadata (one CSV per accession)**
 
-Use `--output-dir` — each study gets its own file, so column detection in Steps 3–4 works per-study with no schema collision:
+Use `--output-dir` — each study gets its own file, so column detection in Steps 3–4 works per-study with no schema collision. Run it in the background — for any non-trivial batch this takes minutes, and there's no reason to block:
 
 ```bash
 uv run --with requests python3 ${CLAUDE_PLUGIN_ROOT}/scripts/get_ena_project_samples.py \
   --input-csv input.csv \
   --output-dir input_stem_metadata/samples/ \
-  2>input_stem_metadata/fetch.log
+  2>input_stem_metadata/fetch.log &
 ```
 
-If the accession column has an ambiguous name, specify it explicitly with `--id-column study_accession`. Check progress:
+If the accession column has an ambiguous name, specify it explicitly with `--id-column study_accession`. While it runs, move on to writing the Step 3 extraction script. Check progress when needed:
 
 ```bash
 tail -5 input_stem_metadata/fetch.log
 ```
+
+Wait until the fetch is fully complete (log shows all accessions done, no more output) before running the extraction script.
 
 **Step 3 — Per-study phenotype extraction with false-positive guard**
 
@@ -155,7 +157,22 @@ For each study CSV in `samples/`, detect age/sex/disease columns by name, valida
 - `input_stem_metadata/phenotype_samples.csv` — one row per sample: `study_accession`, `sample_accession`, `age`, `sex`, `disease`, `disease_col_name`, `dis_source`
 - `input_stem_metadata/study_summary.csv` — one row per study: `study_accession`, `n_samples`, `age_col`, `sex_col`, `dis_col`, `dis_source`, `n_with_disease`
 
-`dis_col` is always the name of the actual CSV column that was read (e.g. `host_disease`, `sample_alias`, `sample_title`). `dis_source` is `direct` when disease values are read straight from a named column, `alias` when they are decoded from a sample alias or title pattern. Write a script to do this — don't try to inline it.
+`dis_col` is always the name of the actual CSV column that was read — `host_disease` for a direct column, or `sample_alias`/`sample_title` for alias-decoded studies. Never leave `dis_col` blank when disease was decoded from aliases; the column name must be there. `dis_source` is `direct` for named columns, `alias` for alias/title decoding. Both `dis_col` and `dis_source` are blank only when no disease signal was found at all (`n_with_disease = 0`). Write a script to do this — don't try to inline it.
+
+**Probe schema with shell tools before writing the script — never read a CSV into context:**
+
+```bash
+# List all column names for a study
+head -1 input_stem_metadata/samples/ACCESSION.csv | tr ',' '\n' | nl
+
+# Unique value distribution for a candidate column (replace N with column number)
+cut -d, -fN input_stem_metadata/samples/ACCESSION.csv | tail -n +2 | sort | uniq -c | sort -rn | head -20
+
+# For alias pattern detection — all unique alias values
+cut -d, -fN input_stem_metadata/samples/ACCESSION.csv | tail -n +2 | sort -u | head -30
+```
+
+Do this for every study CSV. The column list tells you which names to regex-match; the `uniq -c` output tells you value distributions without loading any rows into context. Only run the extraction script once you know which columns exist and what their values look like.
 
 **Column detection — Python `re`, case-insensitive:**
 
@@ -329,7 +346,7 @@ Use the paper's abstract to infer group structure when metadata alone is insuffi
 
 ### Phenotypic Data Extraction
 
-Extract `age`, `sex`, and `disease` when present. Use the two-stage approach — regex first, controlled file read second — as described in the "Extract phenotype metadata from a CSV of accessions" use case above. Never read a full metadata CSV into context.
+Extract `age`, `sex`, and `disease` when present. Use the two-stage approach — regex first, shell-tool probe second — as described in the "Extract phenotype metadata from a CSV of accessions" use case above. Never read a full metadata CSV into context: use `head -1 | tr ',' '\n'` to list columns, `cut -d, -fN | sort | uniq -c | head -20` to inspect value distributions, and `cut -d, -fN | sort -u | head -30` for alias uniqueness — all without loading rows.
 
 **Age:** Pattern: `^age$|^age_|_age$|host_age` (case-insensitive, Python `re`). Record raw value; note unit if the column name implies it (e.g., `age_months`). Use `<min>-<max>` if the value is a range.
 
